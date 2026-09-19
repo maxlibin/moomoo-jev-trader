@@ -100,3 +100,19 @@ def test_quote_tick_publishes_a_feed_error_when_the_gateway_fails():
     quote_tick(failing_quote, fixture_feed("2026-09-15 15:00"), "SPCX", now, store)
 
     assert "quote rights" in store.latest_quote().error
+
+
+def test_quote_tick_publishes_a_conversion_error_instead_of_raising():
+    from watcher import quote_tick
+
+    store = SignalStore()
+    now = pd.Timestamp("2026-09-15 15:00:41", tz=NEW_YORK)
+
+    def malformed_quote(symbol: str):
+        raise ValueError(f"Moomoo quote frame for {symbol} is missing ['last_price'] or is empty")
+
+    quote_tick(malformed_quote, fixture_feed("2026-09-15 15:00"), "SPCX", now, store)
+
+    live = store.latest_quote()
+    assert live.price is None
+    assert "last_price" in live.error

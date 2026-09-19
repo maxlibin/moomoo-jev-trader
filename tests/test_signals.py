@@ -1,4 +1,4 @@
-"""Behavior tests for the one-minute signal engine on real SPCX and QQQ bars."""
+"""Behavior tests for the one-minute signal engine on the synthetic SPCX and QQQ fixture bars."""
 
 from pathlib import Path
 

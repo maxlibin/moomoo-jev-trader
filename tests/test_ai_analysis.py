@@ -7,7 +7,7 @@ import pytest
 
 from pathlib import Path
 
-from ai_analysis import JevReviewer, append_review, build_state, gate_decision
+from ai_analysis import JevReviewer, append_review, build_state, gate_decision, gate_mode_from_env
 from bars_csv import load_bars_csv
 from signals import DEFAULT_CONFIG, evaluate, indicator_frame
 from state import Candle, LiveQuote, Snapshot
@@ -135,3 +135,10 @@ def test_gate_requires_a_fresh_review_for_the_same_candle():
     assert gate_decision(old, snapshot, now)[0] is None
     wrong = {**review, "candle": "2026-09-15T14:58:00-04:00"}
     assert gate_decision(wrong, snapshot, now)[0] is None
+
+
+def test_gate_mode_accepts_only_shadow_or_enforce():
+    assert gate_mode_from_env({}) == "shadow"
+    assert gate_mode_from_env({"JEV_ENTRY_GATE_MODE": " Enforce "}) == "enforce"
+    with pytest.raises(ValueError, match="JEV_ENTRY_GATE_MODE.*'enforced'"):
+        gate_mode_from_env({"JEV_ENTRY_GATE_MODE": "enforced"})

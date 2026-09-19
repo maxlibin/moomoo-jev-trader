@@ -54,7 +54,7 @@ def tick(fetch: BarFetch, symbol: str, benchmark: str, now: pd.Timestamp, store:
     try:
         bars = completed_minute_bars(fetch(symbol), now)
         benchmark_bars = completed_minute_bars(fetch(benchmark), now)
-    except ConnectionError as exc:
+    except (ConnectionError, ValueError) as exc:
         logger.warning("feed error", extra={"symbol": symbol, "error": str(exc)})
         store.publish(_feed_error(symbol, benchmark, now, str(exc)))
         return
@@ -89,11 +89,16 @@ def tick(fetch: BarFetch, symbol: str, benchmark: str, now: pd.Timestamp, store:
 
 
 def quote_tick(fetch_quote: QuoteFetch, fetch_bars: BarFetch, symbol: str, now: pd.Timestamp, store: SignalStore) -> None:
-    """Publish the last price and the forming candle, or the feed error."""
+    """Publish the last price and the forming candle, or the feed error.
+
+    ``ConnectionError`` is the gateway failing; ``ValueError`` is the gateway
+    answering with a frame the converters reject. Both are published rather
+    than raised so the quote thread outlives them.
+    """
     try:
         quote = fetch_quote(symbol)
         forming = forming_candle(fetch_bars(symbol), now)
-    except ConnectionError as exc:
+    except (ConnectionError, ValueError) as exc:
         logger.warning("quote error", extra={"symbol": symbol, "error": str(exc)})
         store.publish_quote(LiveQuote(symbol=symbol, price=None, quoted_at=None, forming=None, published_at=now, error=str(exc)))
         return

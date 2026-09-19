@@ -1,4 +1,4 @@
-"""Fee-aware event backtester on real one-minute bars."""
+"""Fee-aware event backtester on the synthetic one-minute fixture bars."""
 
 from dataclasses import replace
 from pathlib import Path
@@ -28,7 +28,7 @@ def test_simulate_trades_the_fixture_days_with_modelled_fills():
     for trade in trades:
         assert trade.reason in {"stop", "target", "cutoff"}
         assert trade.exit_at > trade.entry_at
-        assert trade.entry_at.time() >= DEFAULT_LIMITS.last_entry or trade.entry_at.time() < DEFAULT_LIMITS.last_entry
+        assert trade.entry_at.time() <= DEFAULT_LIMITS.last_entry
         if trade.reason == "stop":
             assert trade.exit_price < trade.stop
         if trade.reason == "cutoff":

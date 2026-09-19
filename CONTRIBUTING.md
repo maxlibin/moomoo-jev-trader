@@ -8,4 +8,4 @@ Contributions are welcome.
 4. Run `python -m pytest -q`.
 5. Open a pull request explaining behavior and risk implications.
 
-Never include API keys, Moomoo credentials, account identifiers, `.env`, trading logs, or private market-data exports. Changes that affect live order execution should preserve safe defaults and document their failure behavior.
+Never include API keys, Moomoo credentials, account identifiers, `.env`, trading logs, or private market-data exports. Test bars are synthetic: change `tests/fixtures/generate.py` and re-run it rather than committing exported candles. Changes that affect live order execution should preserve safe defaults and document their failure behavior.

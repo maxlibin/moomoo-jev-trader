@@ -5,9 +5,9 @@ from pathlib import Path
 import pandas as pd
 
 from bars_csv import load_bars_csv
-from dashboard import create_app
+from dashboard import FLATTEN_HEADER, FLATTEN_HEADER_VALUE, create_app
 from signals import DEFAULT_CONFIG, evaluate, indicator_frame
-from state import SignalStore, Snapshot
+from state import LiveQuote, SignalStore, Snapshot
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -148,6 +148,7 @@ def test_live_api_uses_real_snapshot_ohlc_bars_for_the_chart():
     assert last["low"] == expected["low"]
     assert last["close"] == expected["close"]
     assert last["complete"] is True
+    assert "quotes" not in payload
 
 
 def test_execution_api_reports_state_and_kill_switch():
@@ -165,5 +166,60 @@ def test_execution_api_reports_state_and_kill_switch():
     assert payload["trades_today"] == 0
     assert payload["halted"] is None
 
-    assert client.post("/api/flatten").status_code == 200
+    assert client.post("/api/flatten", headers={FLATTEN_HEADER: FLATTEN_HEADER_VALUE}).status_code == 200
     assert store.kill_switch_pulled() is True
+
+
+def test_flatten_rejects_requests_without_the_dashboard_header_or_from_a_foreign_host():
+    store = SignalStore()
+    client = create_app(store, review=lambda snapshot: {"verdict": "NOT TRIGGERED"}).test_client()
+
+    assert client.post("/api/flatten").status_code == 403
+    assert client.post("/api/flatten", headers={"Origin": "http://evil.example"}).status_code == 403
+    assert client.post("/api/flatten", headers={"Host": "evil.example:8050", FLATTEN_HEADER: FLATTEN_HEADER_VALUE}).status_code == 400
+    assert store.kill_switch_pulled() is False
+
+    assert client.post("/api/flatten", headers={"Host": "127.0.0.1:8050", FLATTEN_HEADER: FLATTEN_HEADER_VALUE}).status_code == 200
+    assert store.kill_switch_pulled() is True
+
+
+def test_live_api_surfaces_the_quote_feed_error_and_counts_completed_reviews():
+    store = SignalStore()
+    now = pd.Timestamp("2026-09-15 15:00:41", tz=NEW_YORK)
+    store.publish_quote(LiveQuote("SPCX", None, None, None, now, "quote rights taken by the moomoo app"))
+    for _ in range(3):
+        store.publish_jev({"status": "complete", "approved": False, "evaluated_at": now.isoformat()})
+    store.publish_jev({"status": "error", "summary": "Jev request failed"})
+    client = create_app(store, review=lambda snapshot: {"verdict": "WAIT"}).test_client()
+
+    payload = client.get("/api/live").get_json()
+
+    assert payload["latest_quote"] is None
+    assert payload["latest_quote_error"] == "quote rights taken by the moomoo app"
+    assert payload["review_count"] == 3 and len(payload["reviews"]) == 3
+    assert payload["latest_review"]["status"] == "error"
+
+
+def test_execution_api_reports_a_pending_exit_and_broker_errors():
+    from dataclasses import replace
+
+    from executor import ExecutionState, PendingExit
+    from trader import OpenPosition
+
+    store = SignalStore()
+    now = pd.Timestamp("2026-09-15 15:00:41", tz=NEW_YORK)
+    position = OpenPosition("SPCX", 10, 150.0, 149.0, 153.0, now)
+    state = replace(
+        ExecutionState.fresh(),
+        position=position,
+        pending_exit=PendingExit("sell-1", 10, "stop", now),
+        broker_error="OpenD order_list_query failed",
+    )
+    store.publish_execution(state)
+    client = create_app(store, review=lambda snapshot: {"verdict": "WAIT"}).test_client()
+
+    payload = client.get("/api/execution").get_json()
+
+    assert payload["position"]["quantity"] == 10
+    assert payload["pending_exit"] == {"order_id": "sell-1", "quantity": 10, "reason": "stop", "placed_at": now.isoformat()}
+    assert payload["broker_error"] == "OpenD order_list_query failed"

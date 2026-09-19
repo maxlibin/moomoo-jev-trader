@@ -1,6 +1,6 @@
 """Walk-forward backtest of the setup rules on the Moomoo history in ``data/``.
 
-Run with the tradingagents environment after ``download_history.py``::
+Run from the project's ``.venv`` after ``download_history.py``::
 
     python run_backtest.py
 

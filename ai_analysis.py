@@ -12,7 +12,7 @@ import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Mapping, Optional
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -32,6 +32,16 @@ MAX_GATE_AGE_SECONDS = float(os.getenv("JEV_MAX_GATE_AGE_SECONDS", "15"))
 MAX_QUOTE_AGE_SECONDS = float(os.getenv("JEV_MAX_QUOTE_AGE_SECONDS", "60"))
 RECENT_BARS = int(os.getenv("JEV_RECENT_BARS", "30"))
 REVIEWS_JOURNAL = Path(__file__).parent / "logs" / "jev_reviews.jsonl"
+GATE_MODES = ("shadow", "enforce")
+
+
+def gate_mode_from_env(env: Mapping[str, str]) -> str:
+    """``JEV_ENTRY_GATE_MODE`` normalised to ``shadow`` or ``enforce``; anything else refuses to start."""
+    mode = env.get("JEV_ENTRY_GATE_MODE", "shadow").strip().lower()
+    if mode not in GATE_MODES:
+        raise ValueError(f"JEV_ENTRY_GATE_MODE must be one of {list(GATE_MODES)}, got {env['JEV_ENTRY_GATE_MODE']!r}")
+    return mode
+
 
 QUESTIONS = {
     "direction": Choice(
@@ -151,7 +161,7 @@ class JevReviewer:
         self.client = client
         if self.client is None and os.getenv("TYPESAFE_API_KEY"):
             timeout = float(os.getenv("JEV_TIMEOUT_SECONDS", "4"))
-            self.client = TypeSafeClient(model=MODEL, retry=RetryPolicy(max_retries=0, timeout=timeout))
+            self.client = TypeSafeClient(model=MODEL, timeout=timeout, retry=RetryPolicy(max_retries=0))
 
     def review(self, snapshot: Snapshot, quote: LiveQuote) -> dict:
         if snapshot.setup is None:

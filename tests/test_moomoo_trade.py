@@ -1,4 +1,4 @@
-"""Broker connector against the Moomoo simulated account through a running OpenD gateway."""
+"""Broker connector: constructor validation everywhere, order round trips only against a running OpenD gateway."""
 
 import socket
 import time
@@ -19,7 +19,7 @@ def gateway_listening() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not gateway_listening(), reason="OpenD is not running on 127.0.0.1:11111")
+needs_gateway = pytest.mark.skipif(not gateway_listening(), reason="OpenD is not running on 127.0.0.1:11111")
 
 
 @pytest.fixture
@@ -30,6 +30,7 @@ def broker() -> MoomooBroker:
     broker.close()
 
 
+@needs_gateway
 def test_account_and_position_read_from_the_simulated_account(broker: MoomooBroker):
     account = broker.account()
 
@@ -38,6 +39,7 @@ def test_account_and_position_read_from_the_simulated_account(broker: MoomooBrok
     assert broker.position_quantity("SPCX") >= 0
 
 
+@needs_gateway
 def test_limit_buy_far_below_market_is_accepted_then_cancelled(broker: MoomooBroker):
     order_id = broker.buy_limit("SPCX", 1, 1.00)
 
@@ -55,3 +57,8 @@ def test_limit_buy_far_below_market_is_accepted_then_cancelled(broker: MoomooBro
 def test_real_environment_requires_explicit_opt_in():
     with pytest.raises(ValueError, match="REAL"):
         MoomooBroker(HOST, PORT, "LIVE", "FUTUSG")
+
+
+def test_unknown_security_firm_is_rejected_with_the_valid_names():
+    with pytest.raises(ValueError, match="MOOMOO_SECURITY_FIRM 'FUTUXX' is not one of .*FUTUSG"):
+        MoomooBroker(HOST, PORT, "SIMULATE", "FUTUXX")

@@ -63,10 +63,10 @@ class SignalStore:
         self._lock = threading.Lock()
         self._snapshot: Optional[Snapshot] = None
         self._quote: Optional[LiveQuote] = None
-        self._quotes: deque[LiveQuote] = deque(maxlen=900)
         self._execution: object = None
         self._jev_review: Optional[dict] = None
-        self._jev_reviews: deque[dict] = deque(maxlen=500)
+        self._jev_reviews: deque[dict] = deque(maxlen=100)
+        self._jev_completed = 0
         self._kill_switch = False
 
     def publish_execution(self, execution: object) -> None:
@@ -78,14 +78,21 @@ class SignalStore:
             self._jev_review = review
             if review.get("status") == "complete":
                 self._jev_reviews.append(review)
+                self._jev_completed += 1
 
     def latest_jev(self) -> Optional[dict]:
         with self._lock:
             return self._jev_review
 
     def jev_history(self) -> list[dict]:
+        """The most recent completed reviews, as many as the dashboard chart and feed display."""
         with self._lock:
             return list(self._jev_reviews)
+
+    def jev_completed(self) -> int:
+        """Completed reviews since start-up, beyond what ``jev_history`` retains."""
+        with self._lock:
+            return self._jev_completed
 
     def latest_execution(self) -> object:
         with self._lock:
@@ -110,19 +117,10 @@ class SignalStore:
     def publish_quote(self, quote: LiveQuote) -> None:
         with self._lock:
             self._quote = quote
-            if quote.error is None and quote.price is not None:
-                previous = self._quotes[-1] if self._quotes else None
-                changed = previous is None or previous.quoted_at != quote.quoted_at or previous.price != quote.price
-                if changed:
-                    self._quotes.append(quote)
 
     def latest_quote(self) -> Optional[LiveQuote]:
         with self._lock:
             return self._quote
-
-    def quote_history(self) -> list[LiveQuote]:
-        with self._lock:
-            return list(self._quotes)
 
 
 STORE = SignalStore()

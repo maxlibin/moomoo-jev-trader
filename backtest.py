@@ -3,7 +3,7 @@
 Replays completed candles through ``signals.evaluate`` exactly as the live
 watcher does, fills entries at the next candle's open capped at the limit price,
 exits on the stop (with slippage), the target, or the session cutoff, and nets
-fees per order. Pure functions over bar frames; no broker, no Lumibot.
+fees per order. Pure functions over bar frames; no broker involved.
 """
 
 from dataclasses import dataclass

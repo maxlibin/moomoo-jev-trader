@@ -1,13 +1,22 @@
-"""Live browser dashboard for prices, Jev decisions, setup rules, and execution."""
+"""Live browser dashboard for prices, Jev decisions, setup rules, and execution.
+
+The server only trusts loopback ``Host`` headers, and the kill switch endpoint
+requires a custom request header that a cross-site page cannot send without a
+CORS preflight this server never approves.
+"""
 
 from typing import Callable, Optional
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 from executor import ExecutionState
 from signals import BUY_SIGNALS, SELL_SIGNALS, Setup
 from state import LiveQuote, SignalStore, Snapshot
 
+
+TRUSTED_HOSTS = ["127.0.0.1", "localhost"]
+FLATTEN_HEADER = "X-Requested-With"
+FLATTEN_HEADER_VALUE = "moomoo-jev-trader"
 
 DASHBOARD = r"""
 <!doctype html>
@@ -85,8 +94,10 @@ DASHBOARD = r"""
 </div>
 <script>
 let setupData=null, liveData=null;
+const errors={setup:null,live:null,quote:null};
 const $=id=>document.getElementById(id), pct=n=>Number.isFinite(n)?Math.round(n*100)+'%':'—', money=n=>Number.isFinite(n)?'$'+n.toFixed(2):'—';
 function text(id,value){$(id).textContent=value}
+function showErrors(){const msg=errors.setup||errors.live||errors.quote;text('error',msg||'');$('error').style.display=msg?'block':'none'}
 function directionClass(d){return d==='up'?'wordUp':d==='down'?'wordDown':'wordSideways'}
 function bars(review){
   const probs=review?.direction?.probabilities||{up:0,sideways:0,down:0}; const colors={up:'var(--buy)',sideways:'#d5a342',down:'var(--sell)'};
@@ -101,7 +112,7 @@ function renderReview(r){
   text('s-direction',d.toUpperCase());$('s-direction').className='v '+directionClass(d);text('s-up',pct(up));text('s-latency',(r.latency_ms||0)+'ms');
 }
 function renderFeed(reviews){
-  const list=$('feed');list.innerHTML='';reviews.slice(-16).reverse().forEach(r=>{const d=r.direction?.choice||'sideways',up=r.direction?.probabilities?.up||0,q=r.entry_quality?.choice||'—';const row=document.createElement('div');row.className='feedRow';[new Date(r.evaluated_at).toLocaleTimeString([], {hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}),d.toUpperCase(),pct(up),q,(r.latency_ms||0)+'ms'].forEach((v,i)=>{const s=document.createElement('span');s.textContent=v;if(i===1)s.className=directionClass(d);row.append(s)});list.append(row)});text('s-calls',reviews.length)}
+  const list=$('feed');list.innerHTML='';reviews.slice(-16).reverse().forEach(r=>{const d=r.direction?.choice||'sideways',up=r.direction?.probabilities?.up||0,q=r.entry_quality?.choice||'—';const row=document.createElement('div');row.className='feedRow';[new Date(r.evaluated_at).toLocaleTimeString([], {hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'}),d.toUpperCase(),pct(up),q,(r.latency_ms||0)+'ms'].forEach((v,i)=>{const s=document.createElement('span');s.textContent=v;if(i===1)s.className=directionClass(d);row.append(s)});list.append(row)})}
 function renderStrip(reviews){const el=$('strip');el.innerHTML='';reviews.slice(-90).forEach(r=>{const i=document.createElement('i');i.className='tick '+(r.direction?.choice||'sideways');i.title=new Date(r.evaluated_at).toLocaleTimeString()+' '+(r.direction?.choice||'');el.append(i)})}
 function renderChart(bars,reviews,latestQuote){
   if(!bars?.length)return;const svg=$('chart'),box=svg.getBoundingClientRect(),W=Math.max(400,box.width),H=Math.max(300,box.height),top=95,bottom=72,left=18,right=76,ns='http://www.w3.org/2000/svg';svg.setAttribute('viewBox',`0 0 ${W} ${H}`);
@@ -115,10 +126,16 @@ function renderChart(bars,reviews,latestQuote){
 }
 function renderChecks(id,checks){const el=$(id);el.innerHTML='';Object.entries(checks||{}).forEach(([name,ok])=>{const li=document.createElement('li'),a=document.createElement('span'),b=document.createElement('span');a.textContent=name;b.textContent=ok?'✓':'×';b.className=ok?'yes':'no';li.append(a,b);el.append(li)})}
 function renderSetup(data){if(!data)return;const s=data.summary;text('setup-call',data.action.headline);text('setup-detail',data.action.detail);renderChecks('buy-checks',s.buy_checks);renderChecks('sell-checks',s.sell_checks)}
-function renderExecution(x){if(!x){text('execution','Auto trading is not running');$('kill').style.display='none';return}text('mode',x.jev_gate_mode||'shadow');text('s-trades',x.trades_today);let msg=x.halted?'STOPPED · '+x.halted:x.position?`${x.position.quantity} shares @ ${x.position.entry_price.toFixed(2)} · P&L ${x.daily_pnl.toFixed(2)}`:x.pending_order?`Limit buy ${x.pending_order.quantity} @ ${x.pending_order.limit_price.toFixed(2)}`:'Watching for entries';text('execution',x.environment+' · '+msg+(x.last_skip?' · '+x.last_skip:''));$('kill').style.display='inline-block'}
-async function refreshSetup(){try{const r=await fetch('/api/data',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||'setup unavailable');setupData=d;renderSetup(d)}catch(e){text('error',e.message);$('error').style.display='block'}}
-async function refreshLive(){try{const r=await fetch('/api/live',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||'live data unavailable');liveData=d;$('error').style.display='none';renderReview(d.latest_review);renderFeed(d.reviews);renderStrip(d.reviews);renderChart(d.bars,d.reviews,d.latest_quote);renderExecution(d.execution)}catch(e){$('dot').className='dot off';text('connection','reconnecting');text('error',e.message);$('error').style.display='block'}}
-$('kill').addEventListener('click',async()=>{if(confirm('Cancel entries, flatten the position, and stop trading?'))await fetch('/api/flatten',{method:'POST'})});
+function renderExecution(x){
+  if(!x){text('execution','Auto trading is not running');$('kill').style.display='none';return}
+  text('mode',x.jev_gate_mode||'shadow');text('s-trades',x.trades_today);
+  const held=x.position?`${x.position.quantity} shares @ ${x.position.entry_price.toFixed(2)} · P&L ${x.daily_pnl.toFixed(2)}`:null;
+  let msg=x.halted?'STOPPED · '+x.halted+(held?' · still holding '+held:''):x.pending_exit?`Selling ${x.pending_exit.quantity} shares (${x.pending_exit.reason})`:held?held:x.pending_order?`Limit buy ${x.pending_order.quantity} @ ${x.pending_order.limit_price.toFixed(2)}`:'Watching for entries';
+  if(x.broker_error)msg+=' · broker error: '+x.broker_error;
+  text('execution',x.environment+' · '+msg+(x.last_skip?' · '+x.last_skip:''));$('kill').style.display='inline-block'}
+async function refreshSetup(){try{const r=await fetch('/api/data',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||'setup unavailable');errors.setup=null;setupData=d;renderSetup(d)}catch(e){errors.setup=e.message}showErrors()}
+async function refreshLive(){try{const r=await fetch('/api/live',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||'live data unavailable');errors.live=null;errors.quote=d.latest_quote_error;liveData=d;renderReview(d.latest_review);renderFeed(d.reviews);renderStrip(d.reviews);renderChart(d.bars,d.reviews,d.latest_quote);text('s-calls',d.review_count);if(d.latest_quote_error){$('dot').className='dot off';text('connection','feed error')}renderExecution(d.execution)}catch(e){$('dot').className='dot off';text('connection','reconnecting');errors.live=e.message}showErrors()}
+$('kill').addEventListener('click',async()=>{if(confirm('Cancel entries, flatten the position, and stop trading?'))await fetch('/api/flatten',{method:'POST',headers:{'{{ flatten_header }}':'{{ flatten_header_value }}'}})});
 refreshSetup();refreshLive();setInterval(refreshSetup,5000);setInterval(refreshLive,2000);window.addEventListener('resize',()=>liveData&&renderChart(liveData.bars,liveData.reviews,liveData.latest_quote));
 </script>
 </body></html>
@@ -171,9 +188,10 @@ def quote_payload(quote: LiveQuote) -> dict:
 
 
 def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: str = "shadow") -> dict:
-    position, pending = state.position, state.pending_order
+    position, pending, exiting = state.position, state.pending_order, state.pending_exit
     return {
         "environment": environment, "jev_gate_mode": jev_gate_mode, "halted": state.halted,
+        "broker_error": state.broker_error,
         "last_skip": state.last_skip, "trades_today": state.trades_today, "daily_pnl": state.daily_pnl,
         "position": None if position is None else {
             "quantity": position.quantity, "entry_price": position.entry_price, "stop": position.stop,
@@ -182,6 +200,11 @@ def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: st
         "pending_order": None if pending is None else {
             "order_id": pending.order_id, "quantity": pending.quantity,
             "limit_price": pending.limit_price, "placed_at": pending.placed_at.isoformat(),
+            "cancel_requested": pending.cancel_requested,
+        },
+        "pending_exit": None if exiting is None else {
+            "order_id": exiting.order_id, "quantity": exiting.quantity,
+            "reason": exiting.reason, "placed_at": exiting.placed_at.isoformat(),
         },
         "fills": [{"side": f.side, "quantity": f.quantity, "price": f.price, "at": f.at.isoformat(), "reason": f.reason} for f in state.fills],
     }
@@ -190,6 +213,7 @@ def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: st
 def create_app(store: SignalStore, review: Callable[[Snapshot], dict], environment: str = "SIMULATE", jev_gate_mode: str = "shadow") -> Flask:
     app = Flask(__name__)
     app.json.sort_keys = False
+    app.config["TRUSTED_HOSTS"] = TRUSTED_HOSTS
 
     @app.get("/")
     def index():
@@ -198,6 +222,8 @@ def create_app(store: SignalStore, review: Callable[[Snapshot], dict], environme
             DASHBOARD,
             symbol=snapshot.symbol if snapshot else "Watcher",
             benchmark=snapshot.benchmark if snapshot else "benchmark",
+            flatten_header=FLATTEN_HEADER,
+            flatten_header_value=FLATTEN_HEADER_VALUE,
         )
 
     @app.get("/api/data")
@@ -220,10 +246,6 @@ def create_app(store: SignalStore, review: Callable[[Snapshot], dict], environme
 
     @app.get("/api/live")
     def live():
-        quotes = [
-            {"price": item.price, "at": (item.quoted_at or item.published_at).isoformat()}
-            for item in store.quote_history()
-        ]
         snapshot = store.latest()
         bars = []
         if snapshot is not None and snapshot.session is not None:
@@ -248,9 +270,10 @@ def create_app(store: SignalStore, review: Callable[[Snapshot], dict], environme
         execution = execution_payload(state, environment, jev_gate_mode) if state is not None else None
         return jsonify(
             bars=bars,
-            quotes=quotes,
             latest_quote=quote_payload(latest_quote) if latest_quote is not None and latest_quote.error is None else None,
+            latest_quote_error=latest_quote.error if latest_quote is not None else None,
             reviews=store.jev_history(),
+            review_count=store.jev_completed(),
             latest_review=store.latest_jev(),
             execution=execution,
         )
@@ -264,6 +287,11 @@ def create_app(store: SignalStore, review: Callable[[Snapshot], dict], environme
 
     @app.post("/api/flatten")
     def flatten():
+        if request.headers.get(FLATTEN_HEADER) != FLATTEN_HEADER_VALUE:
+            return jsonify(
+                error=f"the kill switch requires the header {FLATTEN_HEADER}: {FLATTEN_HEADER_VALUE}; "
+                "a page on another origin cannot send it, which is what keeps cross-site pages from flattening the account"
+            ), 403
         store.pull_kill_switch()
         return jsonify(status="kill switch pulled; the executor flattens on its next pass")
 

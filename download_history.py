@@ -1,6 +1,6 @@
 """Download one-minute history from Moomoo OpenD into ``data/`` for the backtest.
 
-Run with the tradingagents environment while OpenD is running::
+Run from the project's ``.venv`` while OpenD is running::
 
     python download_history.py
 

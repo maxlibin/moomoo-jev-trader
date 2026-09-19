@@ -33,12 +33,12 @@ class MoomooBroker:
     def __init__(self, host: str, port: int, environment: str, security_firm: str) -> None:
         if environment not in ENVIRONMENTS:
             raise ValueError(f"MOOMOO_TRADE_ENV must be SIMULATE or REAL, got {environment!r}")
-        if not hasattr(SecurityFirm, security_firm):
-            raise ValueError(f"MOOMOO_SECURITY_FIRM {security_firm!r} is not one of {[f.name for f in SecurityFirm]}")
+        if not SecurityFirm.if_has_key(security_firm):
+            raise ValueError(f"MOOMOO_SECURITY_FIRM {security_firm!r} is not one of {SecurityFirm.get_all_keys()}")
         self._host = host
         self._port = port
         self._environment = ENVIRONMENTS[environment]
-        self._security_firm = getattr(SecurityFirm, security_firm)
+        self._security_firm = security_firm
         self._context: Optional[OpenSecTradeContext] = None
 
     @property
