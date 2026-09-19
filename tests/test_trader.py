@@ -586,11 +586,11 @@ def test_unconfirmed_exit_is_recovered_from_the_broker_instead_of_being_re_sent(
     assert attempted.position == position and attempted.pending_exit.order_id is None
     assert "Timeout" in attempted.broker_error and attempted.halted is None
 
-    recovered = executor_pass(attempted, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    recovered = executor_pass(attempted, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
     assert recovered.pending_exit.order_id == "sell-1" and recovered.broker_error is None
     assert broker.sells == [("SPCX", 10)]
 
-    settled = executor_pass(recovered, store, broker, "SPCX", t0 + 6 * SECONDS, DEFAULT_LIMITS, None)
+    settled = executor_pass(recovered, store, broker, "SPCX", t0 + 8 * SECONDS, DEFAULT_LIMITS, None)
     assert is_flat(settled) and settled.halted is None
     assert settled.daily_pnl == pytest.approx((setup.stop - 0.02 - setup.price) * 10)
     assert broker.sells == [("SPCX", 10)]
@@ -618,11 +618,11 @@ def test_unconfirmed_exit_is_re_sent_only_when_the_broker_still_shows_every_shar
     attempted = executor_pass(state, store, broker, "SPCX", t0, DEFAULT_LIMITS, None)
     assert attempted.pending_exit.order_id is None and broker.sells == []
 
-    re_sent = executor_pass(attempted, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    re_sent = executor_pass(attempted, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
     assert re_sent.pending_exit.order_id == "sell-1" and broker.sells == [("SPCX", 10)]
 
-    settled = executor_pass(re_sent, store, broker, "SPCX", t0 + 6 * SECONDS, DEFAULT_LIMITS, None)
-    assert is_flat(settled) and settled.halted is None
+    settled = executor_pass(re_sent, store, broker, "SPCX", t0 + 8 * SECONDS, DEFAULT_LIMITS, None)
+    assert is_flat(settled) and settled.halted is None and settled.exit_failures == 0
 
 
 def test_unconfirmed_exit_with_shares_gone_adopts_the_broker_quantity_and_halts():
@@ -638,13 +638,13 @@ def test_unconfirmed_exit_with_shares_gone_adopts_the_broker_quantity_and_halts(
 
     partly_gone = NeverAccepts({}, held=4)
     attempted = executor_pass(state, store, partly_gone, "SPCX", t0, DEFAULT_LIMITS, None)
-    reconciled = executor_pass(attempted, store, partly_gone, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    reconciled = executor_pass(attempted, store, partly_gone, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
     assert reconciled.position.quantity == 4 and reconciled.pending_exit is None
     assert "6 of 10 tracked shares" in reconciled.halted
 
     all_gone = NeverAccepts({}, held=0)
     attempted = executor_pass(state, store, all_gone, "SPCX", t0, DEFAULT_LIMITS, None)
-    reconciled = executor_pass(attempted, store, all_gone, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    reconciled = executor_pass(attempted, store, all_gone, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
     assert reconciled.position is None and reconciled.pending_exit is None
     assert "10 of 10 tracked shares" in reconciled.halted and reconciled.fills == ()
 
@@ -672,34 +672,61 @@ def test_unconfirmed_entry_is_adopted_when_accepted_and_skipped_otherwise_never_
     adopted = TimedOutEntry({"buy-1": [OrderState("SUBMITTED", 0, 0.0)]}, accepted_anyway=True)
     attempted = executor_pass(ExecutionState.fresh(), store, adopted, "SPCX", t0, DEFAULT_LIMITS, None)
     assert attempted.pending_order.order_id is None and attempted.last_candle == setup.timestamp
-    recovered = executor_pass(attempted, store, adopted, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    recovered = executor_pass(attempted, store, adopted, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
     assert recovered.pending_order.order_id == "buy-1" and len(adopted.buys) == 1
 
     dropped = TimedOutEntry({}, accepted_anyway=False)
     attempted = executor_pass(ExecutionState.fresh(), store, dropped, "SPCX", t0, DEFAULT_LIMITS, None)
-    skipped = executor_pass(attempted, store, dropped, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    skipped = executor_pass(attempted, store, dropped, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
     assert skipped.pending_order is None and skipped.last_candle == setup.timestamp
     assert "not accepted" in skipped.last_skip and len(dropped.buys) == 1
-    again = executor_pass(skipped, store, dropped, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
+    again = executor_pass(skipped, store, dropped, "SPCX", t0 + 8 * SECONDS, DEFAULT_LIMITS, None)
     assert again.pending_order is None and len(dropped.buys) == 1
 
 
-def test_timeout_order_status_halts_but_keeps_polling_until_the_broker_resolves_it():
+def test_timeout_exit_status_is_shown_until_the_broker_settles_it_and_nothing_else_is_sent():
     setup = buy_setup()
     snapshot = snapshot_of(setup)
     t0 = snapshot.published_at
     store = stopped_out_store(setup, snapshot)
     state = replace(ExecutionState.fresh(), position=held_position(setup, t0), last_candle=setup.timestamp)
-    broker = ScriptedBroker({"sell-1": [OrderState("TIMEOUT", 0, 0.0), OrderState("FILLED_ALL", 10, setup.stop)]})
+    broker = ScriptedBroker({"sell-1": [OrderState("TIMEOUT", 0, 0.0), OrderState("TIMEOUT", 0, 0.0), OrderState("FILLED_ALL", 10, setup.stop)]})
 
     placed = step(state, store, broker, "SPCX", t0, DEFAULT_LIMITS)
     unknown = step(placed, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS)
     assert unknown.position is not None and unknown.pending_exit.order_id == "sell-1"
-    assert "TIMEOUT" in unknown.halted and "10 shares" in unknown.halted
+    assert unknown.pending_exit.status == "TIMEOUT" and unknown.halted is None
 
-    resolved = step(unknown, store, broker, "SPCX", t0 + 6 * SECONDS, DEFAULT_LIMITS)
+    store.pull_kill_switch()
+    still_unknown = executor_pass(unknown, store, broker, "SPCX", t0 + 6 * SECONDS, DEFAULT_LIMITS, None)
+    assert still_unknown.pending_exit.status == "TIMEOUT" and broker.sells == [("SPCX", 10)]
+
+    resolved = executor_pass(still_unknown, store, broker, "SPCX", t0 + 10 * SECONDS, DEFAULT_LIMITS, None)
     assert is_flat(resolved) and resolved.fills[-1].price == setup.stop
-    assert "TIMEOUT" in resolved.halted and broker.sells == [("SPCX", 10)]
+    assert resolved.halted == "kill switch" and broker.sells == [("SPCX", 10)]
+
+
+def test_entry_that_times_out_then_fills_is_managed_like_any_other_position():
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = stopped_out_store(setup, snapshot)
+    pending = PendingOrder("buy-1", 10, setup.price, setup.stop, setup.target, t0)
+    state = replace(ExecutionState.fresh(), pending_order=pending, last_candle=setup.timestamp, known_orders=frozenset({"buy-1"}))
+    broker = ScriptedBroker({
+        "buy-1": [OrderState("TIMEOUT", 0, 0.0), OrderState("FILLED_ALL", 10, setup.price)],
+        "sell-1": [OrderState("FILLED_ALL", 10, setup.stop)],
+    })
+
+    unknown = step(state, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS)
+    assert unknown.pending_order.status == "TIMEOUT" and unknown.halted is None and broker.sells == []
+
+    filled = step(unknown, store, broker, "SPCX", t0 + 6 * SECONDS, DEFAULT_LIMITS)
+    assert filled.position.quantity == 10 and filled.halted is None
+    assert filled.pending_exit.reason == "stop" and broker.sells == [("SPCX", 10)]
+
+    closed = step(filled, store, broker, "SPCX", t0 + 10 * SECONDS, DEFAULT_LIMITS)
+    assert is_flat(closed) and closed.halted is None and closed.trades_today == 1
 
 
 def test_fill_cancelled_exit_counts_as_no_fill():
@@ -794,3 +821,147 @@ def test_restore_day_matches_sells_to_buys_and_blocks_a_buy_without_a_journaled_
     append_fill(holding_sold, Fill("sell", 25, 141.0, today, "kill switch"))
     state = restore_day(ExecutionState.fresh(), load_fills(holding_sold), today.date())
     assert state.daily_pnl == 0.0 and state.trades_today == 0 and state.halted is None
+
+
+def test_restart_recovery_never_adopts_an_order_from_before_start_up():
+    class NeverAccepts(ScriptedBroker):
+        def sell_market(self, symbol: str, quantity: int) -> str:
+            if len(self.sells) == 0:
+                self.sells.append((symbol, quantity))
+                raise ConnectionError("OpenD place_order failed: SELL 10 US.SPCX @ 0.0 (SIMULATE): Timeout")
+            return super().sell_market(symbol, quantity)
+
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = stopped_out_store(setup, snapshot)
+    broker = NeverAccepts({
+        "buy-0": [OrderState("FILLED_ALL", 10, setup.price - 2.0)],
+        "sell-0": [OrderState("FILLED_ALL", 10, setup.price - 3.0)],
+        "sell-2": [OrderState("FILLED_ALL", 10, setup.stop)],
+    }, held=10)
+    broker.accepted = [("buy-0", "BUY", 10, setup.price - 2.0), ("sell-0", "SELL", 10, 0.0)]
+
+    booted = initial_state(broker, "SPCX", t0)
+    assert booted.known_orders == frozenset({"buy-0", "sell-0"})
+    state = replace(booted, position=held_position(setup, t0), halted=None, last_candle=setup.timestamp)
+
+    attempted = executor_pass(state, store, broker, "SPCX", t0, DEFAULT_LIMITS, None)
+    assert attempted.pending_exit.order_id is None
+
+    reconciled = executor_pass(attempted, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
+    assert reconciled.pending_exit.order_id == "sell-2" and reconciled.position is not None
+    assert reconciled.fills == () and reconciled.daily_pnl == 0.0
+    assert broker.sells == [("SPCX", 10), ("SPCX", 10)]
+
+
+def test_reconciliation_ignores_an_order_placed_by_hand_before_the_executor_sent_its_own():
+    class TimesOutOnce(ScriptedBroker):
+        def sell_market(self, symbol: str, quantity: int) -> str:
+            if len(self.sells) == 0:
+                self.sells.append((symbol, quantity))
+                raise ConnectionError("OpenD place_order failed: SELL 10 US.SPCX @ 0.0 (SIMULATE): Timeout")
+            return super().sell_market(symbol, quantity)
+
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = stopped_out_store(setup, snapshot)
+    state = replace(ExecutionState.fresh(), position=held_position(setup, t0), last_candle=setup.timestamp)
+    broker = TimesOutOnce({"manual-1": [OrderState("FILLED_ALL", 10, setup.price)], "sell-2": [OrderState("SUBMITTED", 0, 0.0)]}, held=10)
+    broker.accepted.append(("manual-1", "SELL", 10, 0.0))
+
+    attempted = executor_pass(state, store, broker, "SPCX", t0, DEFAULT_LIMITS, None)
+    assert "manual-1" in attempted.known_orders and attempted.pending_exit.order_id is None
+
+    reconciled = executor_pass(attempted, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
+    assert reconciled.pending_exit.order_id == "sell-2" and reconciled.fills == ()
+
+
+def test_unconfirmed_exit_reconciliation_is_paced_like_other_open_orders():
+    class CountingRejects(ScriptedBroker):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.order_list_reads = 0
+
+        def orders(self, symbol: str) -> list[BrokerOrder]:
+            self.order_list_reads += 1
+            return super().orders(symbol)
+
+        def sell_market(self, symbol: str, quantity: int) -> str:
+            raise ConnectionError("OpenD place_order failed: SELL 10 US.SPCX @ 0.0 (SIMULATE): trade not unlocked")
+
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = stopped_out_store(setup, snapshot)
+    state = replace(ExecutionState.fresh(), position=held_position(setup, t0), last_candle=setup.timestamp)
+    broker = CountingRejects({}, held=10)
+
+    attempted = executor_pass(state, store, broker, "SPCX", t0, DEFAULT_LIMITS, None)
+    assert broker.order_list_reads == 1
+    waiting = executor_pass(attempted, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    assert broker.order_list_reads == 1 and waiting.pending_exit.order_id is None
+    executor_pass(waiting, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS, None)
+    assert broker.order_list_reads == 3
+
+
+def test_kill_switch_stops_re_sending_a_sell_after_three_rejections():
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = stopped_out_store(setup, snapshot)
+    store.pull_kill_switch()
+    state = replace(ExecutionState.fresh(), position=held_position(setup, t0), last_candle=setup.timestamp)
+    broker = ScriptedBroker({f"sell-{n}": [OrderState("FAILED", 0, 0.0)] for n in range(1, 10)}, held=10)
+
+    sent_at = {}
+    for offset in range(0, 90, 2):
+        state = executor_pass(state, store, broker, "SPCX", t0 + offset * SECONDS, DEFAULT_LIMITS, None)
+        if len(broker.sells) not in sent_at:
+            sent_at[len(broker.sells)] = offset
+
+    assert len(broker.sells) == 3
+    assert sent_at[1] == 0 and sent_at[2] == 4
+    assert sent_at[3] - sent_at[2] >= 30
+    assert state.position.quantity == 10 and state.pending_exit is None
+    assert state.halted.startswith("kill switch") and "3 sell attempts" in state.halted and "flatten in moomoo" in state.halted
+
+
+def test_run_executor_forever_retries_a_failed_start_up_query_and_publishes_a_crash(monkeypatch):
+    import executor
+
+    class BootBroker(ScriptedBroker):
+        def __init__(self, failures):
+            super().__init__({}, held=0)
+            self.failures = list(failures)
+
+        def holding(self, symbol: str) -> Holding:
+            if self.failures:
+                raise self.failures.pop(0)
+            return super().holding(symbol)
+
+    def sleep_twice_then_stop(_seconds: float) -> None:
+        sleep_twice_then_stop.calls += 1
+        if sleep_twice_then_stop.calls >= 2:
+            raise KeyboardInterrupt
+
+    sleep_twice_then_stop.calls = 0
+    monkeypatch.setattr(executor.time, "sleep", sleep_twice_then_stop)
+    store = SignalStore()
+    broker = BootBroker([ConnectionError("OpenD position_list_query failed for US.SPCX (SIMULATE): disconnected")])
+    published = []
+    monkeypatch.setattr(store, "publish_execution", published.append)
+
+    with pytest.raises(KeyboardInterrupt):
+        executor.run_executor_forever(store, broker, "SPCX", DEFAULT_LIMITS, 0.0)
+
+    assert "starting up" in published[0].halted and "disconnected" in published[0].halted
+    assert published[1].halted is None and is_flat(published[1])
+
+    sleep_twice_then_stop.calls = 0
+    crashing = BootBroker([TypeError("unsupported operand type(s) for /: 'str' and 'int'")])
+    published.clear()
+    with pytest.raises(TypeError):
+        executor.run_executor_forever(store, crashing, "SPCX", DEFAULT_LIMITS, 0.0)
+    assert published[-1].halted.startswith("executor crashed: TypeError")

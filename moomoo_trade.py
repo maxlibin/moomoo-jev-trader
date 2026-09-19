@@ -68,7 +68,7 @@ class MoomooBroker:
         return Account(equity=float(row["total_assets"]), cash=float(row["cash"]))
 
     def holding(self, symbol: str) -> Holding:
-        """Shares held and their average cost, zero when the account has none."""
+        """Shares held and their average cost; the cost is 0.0 when OpenD reports no valid cost for them."""
         code = moomoo_code(symbol)
         ret, data = self._require_context().position_list_query(code=code, trd_env=self._environment)
         if ret != RET_OK:
@@ -77,7 +77,11 @@ class MoomooBroker:
         quantity = int(rows["qty"].sum()) if not rows.empty else 0
         if quantity <= 0:
             return Holding(0, 0.0)
-        return Holding(quantity, float((rows["cost_price"] * rows["qty"]).sum() / quantity))
+        priced = rows.loc[rows["cost_price_valid"].astype(bool)]
+        priced_quantity = int(priced["qty"].sum()) if not priced.empty else 0
+        if priced_quantity <= 0:
+            return Holding(quantity, 0.0)
+        return Holding(quantity, float((priced["cost_price"].astype(float) * priced["qty"]).sum() / priced_quantity))
 
     def orders(self, symbol: str) -> list[BrokerOrder]:
         """Today's orders for ``symbol`` as OpenD reports them, newest first."""

@@ -3,7 +3,9 @@
 import socket
 import time
 
+import pandas as pd
 import pytest
+from moomoo import RET_OK
 
 from moomoo_trade import MoomooBroker
 
@@ -62,3 +64,32 @@ def test_real_environment_requires_explicit_opt_in():
 def test_unknown_security_firm_is_rejected_with_the_valid_names():
     with pytest.raises(ValueError, match="MOOMOO_SECURITY_FIRM 'FUTUXX' is not one of .*FUTUSG"):
         MoomooBroker(HOST, PORT, "SIMULATE", "FUTUXX")
+
+
+class StubTradeContext:
+    """Stands in for OpenSecTradeContext with the frame position_list_query documents, including an unpriced lot."""
+
+    def __init__(self, rows: list[dict]):
+        self.rows = rows
+
+    def position_list_query(self, code: str, trd_env: str):
+        return RET_OK, pd.DataFrame(self.rows)
+
+
+def test_holding_averages_only_the_lots_with_a_valid_cost_price():
+    broker = MoomooBroker(HOST, PORT, "SIMULATE", "FUTUSG")
+
+    broker._context = StubTradeContext([
+        {"code": "US.SPCX", "qty": 10, "cost_price": 150.0, "cost_price_valid": True},
+        {"code": "US.SPCX", "qty": 30, "cost_price": 154.0, "cost_price_valid": True},
+        {"code": "US.QQQ", "qty": 5, "cost_price": 700.0, "cost_price_valid": True},
+    ])
+    priced = broker.holding("SPCX")
+    assert priced.quantity == 40 and priced.cost_price == pytest.approx(153.0)
+
+    broker._context = StubTradeContext([{"code": "US.SPCX", "qty": 25, "cost_price": "N/A", "cost_price_valid": False}])
+    unpriced = broker.holding("SPCX")
+    assert unpriced.quantity == 25 and unpriced.cost_price == 0.0
+
+    broker._context = StubTradeContext([{"code": "US.QQQ", "qty": 5, "cost_price": 700.0, "cost_price_valid": True}])
+    assert broker.holding("SPCX").quantity == 0

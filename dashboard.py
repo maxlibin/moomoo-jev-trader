@@ -131,7 +131,7 @@ function renderExecution(x){
   if(!x){text('execution','Auto trading is not running');$('kill').style.display='none';return}
   text('mode',x.jev_gate_mode||'shadow');text('s-trades',x.trades_today);
   const held=x.position?`${x.position.quantity} shares @ ${x.position.entry_price.toFixed(2)} · P&L ${x.daily_pnl.toFixed(2)}`:null;
-  const unconfirmed=o=>o&&!o.order_id?' · confirming with the broker':'';
+  const unconfirmed=o=>!o?'':!o.order_id?' · confirming with the broker':o.status==='TIMEOUT'?' · TIMEOUT at OpenD, result unknown until it settles (check moomoo)':'';
   let msg=x.halted?'STOPPED · '+x.halted+(held?' · still holding '+held:''):x.pending_exit?`Selling ${x.pending_exit.quantity} shares (${x.pending_exit.reason})`+unconfirmed(x.pending_exit):held?held:x.pending_order?`Limit buy ${x.pending_order.quantity} @ ${x.pending_order.limit_price.toFixed(2)}`+unconfirmed(x.pending_order):'Watching for entries';
   if(x.pending_exit&&x.halted)msg+=` · selling ${x.pending_exit.quantity} shares`+unconfirmed(x.pending_exit);
   if(x.broker_error)msg+=' · broker error: '+x.broker_error;
@@ -209,11 +209,11 @@ def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: st
         "pending_order": None if pending is None else {
             "order_id": pending.order_id, "quantity": pending.quantity,
             "limit_price": pending.limit_price, "placed_at": pending.placed_at.isoformat(),
-            "cancel_requested": pending.cancel_requested,
+            "cancel_requested": pending.cancel_requested, "status": pending.status,
         },
         "pending_exit": None if exiting is None else {
             "order_id": exiting.order_id, "quantity": exiting.quantity,
-            "reason": exiting.reason, "placed_at": exiting.placed_at.isoformat(),
+            "reason": exiting.reason, "placed_at": exiting.placed_at.isoformat(), "status": exiting.status,
         },
         "fills": [{"side": f.side, "quantity": f.quantity, "price": f.price, "at": f.at.isoformat(), "reason": f.reason} for f in state.fills],
     }

@@ -30,12 +30,18 @@ from trader import OpenPosition, RiskLimits, TradePlan, entry_block_reason, exit
 
 NEW_YORK = "America/New_York"
 ORDER_POLL_SECONDS = 4.0
+MAX_EXIT_ATTEMPTS = 3
+EXIT_RETRY_SECONDS = 30.0
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class PendingOrder:
-    """An entry order in flight; ``order_id`` is None until OpenD has confirmed the placement."""
+    """An entry order in flight; ``order_id`` is None until OpenD has confirmed the placement.
+
+    ``status`` is the last status the broker reported for it, so an order whose
+    result OpenD does not know (``TIMEOUT``) is visible while it is re-read.
+    """
 
     order_id: Optional[str]
     quantity: int
@@ -45,6 +51,7 @@ class PendingOrder:
     placed_at: pd.Timestamp
     cancel_requested: bool = False
     checked_at: Optional[pd.Timestamp] = None
+    status: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,7 @@ class PendingExit:
     reason: str
     placed_at: pd.Timestamp
     checked_at: Optional[pd.Timestamp] = None
+    status: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -81,6 +89,8 @@ class ExecutionState:
     pending_exit: Optional[PendingExit] = None
     broker_error: Optional[str] = None
     known_orders: frozenset[str] = frozenset()
+    exit_failures: int = 0
+    last_exit_failure: Optional[pd.Timestamp] = None
 
     @staticmethod
     def fresh() -> "ExecutionState":
@@ -218,7 +228,12 @@ def _filled_quantity(order: OrderState) -> int:
 def _recover_order(
     orders: list[BrokerOrder], side: str, quantity: int, price: Optional[float], known: frozenset[str]
 ) -> Optional[BrokerOrder]:
-    """The newest broker order matching an unconfirmed placement, if OpenD accepted it after all."""
+    """The newest broker order matching an unconfirmed placement, if OpenD accepted it after all.
+
+    ``known`` holds every order id seen before the placement was sent (orders
+    from earlier processes, manual orders, and the executor's own), so only an
+    order that appeared afterwards can be adopted.
+    """
     for order in orders:
         if order.order_id in known or order.side != side or order.quantity != quantity:
             continue
@@ -257,10 +272,27 @@ def _settle_pending(state: ExecutionState, broker: Broker, symbol: str, now: pd.
         logger.info("entry order ended without fill", extra={"order_id": pending.order_id, "status": order.status})
         return replace(state, pending_order=None)
     if order.status in UNKNOWN:
-        reason = f"entry order {pending.order_id} is in {order.status} at OpenD (result unknown); check the order in moomoo before trading again"
-        logger.error("entry order result unknown", extra={"order_id": pending.order_id, "status": order.status})
-        return replace(state, pending_order=replace(pending, checked_at=now), halted=reason)
-    return replace(state, pending_order=replace(pending, checked_at=now))
+        logger.warning("entry order result unknown at OpenD; re-reading until it settles", extra={"order_id": pending.order_id, "status": order.status})
+    return replace(state, pending_order=replace(pending, checked_at=now, status=order.status))
+
+
+def _exit_retry_block(state: ExecutionState, now: pd.Timestamp) -> Optional[str]:
+    """Why another sell must not be sent now: too many rejected attempts, or the pause after the last one is still running."""
+    position = state.position
+    if state.exit_failures >= MAX_EXIT_ATTEMPTS:
+        return (
+            f"{state.exit_failures} sell attempts for {position.quantity} shares of {position.symbol} were rejected; "
+            f"no more will be sent, flatten in moomoo and restart"
+        )
+    if state.exit_failures >= 2:
+        wait = EXIT_RETRY_SECONDS - (now - state.last_exit_failure).total_seconds()
+        if wait > 0:
+            return f"sell for {position.quantity} shares of {position.symbol} was rejected {state.exit_failures} times; next attempt in {wait:.0f}s"
+    return None
+
+
+def _exit_failed(state: ExecutionState, now: pd.Timestamp) -> ExecutionState:
+    return replace(state, pending_exit=None, exit_failures=state.exit_failures + 1, last_exit_failure=now)
 
 
 def _recover_exit(state: ExecutionState, broker: Broker, now: pd.Timestamp) -> ExecutionState:
@@ -280,8 +312,13 @@ def _recover_exit(state: ExecutionState, broker: Broker, now: pd.Timestamp) -> E
         logger.error("position changed outside the executor", extra={"symbol": position.symbol, "tracked": position.quantity, "held": held})
         remaining = None if held <= 0 else replace(position, quantity=held)
         return replace(state, position=remaining, pending_exit=None, halted=reason)
+    failed = _exit_failed(state, now)
+    block = _exit_retry_block(failed, now)
+    if block is not None:
+        logger.error("exit placement was not accepted; not sending another", extra={"symbol": position.symbol, "reason": block})
+        return replace(failed, halted=block)
     logger.info("exit placement was not accepted; placing again", extra={"symbol": position.symbol, "quantity": position.quantity})
-    return _place_exit(replace(state, pending_exit=None), broker, now, exit_order.reason)
+    return _place_exit(failed, broker, now, exit_order.reason)
 
 
 def _settle_exit(state: ExecutionState, broker: Broker, now: pd.Timestamp) -> ExecutionState:
@@ -308,6 +345,8 @@ def _settle_exit(state: ExecutionState, broker: Broker, now: pd.Timestamp) -> Ex
             pending_exit=None,
             daily_pnl=state.daily_pnl + pnl,
             fills=state.fills + (fill,),
+            exit_failures=0,
+            last_exit_failure=None,
         )
     if order.status in DEAD:
         reason = (
@@ -315,40 +354,43 @@ def _settle_exit(state: ExecutionState, broker: Broker, now: pd.Timestamp) -> Ex
             f"{position.quantity} shares of {position.symbol} are still held, use the kill switch or flatten in moomoo"
         )
         logger.error("exit order died", extra={"order_id": exit_order.order_id, "status": order.status, "quantity": position.quantity})
-        return replace(state, pending_exit=None, halted=reason)
+        return replace(_exit_failed(state, now), halted=reason)
     if order.status in UNKNOWN:
-        reason = (
-            f"exit order {exit_order.order_id} is in {order.status} at OpenD (result unknown); "
-            f"{position.quantity} shares of {position.symbol} may or may not have been sold, reconcile in moomoo"
-        )
-        logger.error("exit order result unknown", extra={"order_id": exit_order.order_id, "status": order.status})
-        return replace(state, pending_exit=replace(exit_order, checked_at=now), halted=reason)
-    return replace(state, pending_exit=replace(exit_order, checked_at=now))
+        logger.warning("exit order result unknown at OpenD; re-reading until it settles", extra={"order_id": exit_order.order_id, "status": order.status})
+    return replace(state, pending_exit=replace(exit_order, checked_at=now, status=order.status))
+
+
+def _orders_before(state: ExecutionState, broker: Broker, symbol: str) -> frozenset[str]:
+    """Every order id the broker already reports, so a placement sent next can be told apart from all of them."""
+    return state.known_orders | {order.order_id for order in broker.orders(symbol)}
 
 
 def _place_exit(state: ExecutionState, broker: Broker, now: pd.Timestamp, reason: str) -> ExecutionState:
     """Send the market sell; when OpenD does not confirm it, remember the attempt so it is reconciled, never blindly repeated."""
     position = state.position
+    known = _orders_before(state, broker, position.symbol)
     try:
         order_id = broker.sell_market(position.symbol, position.quantity)
     except ConnectionError as exc:
         logger.warning("exit placement unconfirmed; reconciling with the broker next pass", extra={"symbol": position.symbol, "error": str(exc)})
-        return replace(state, pending_exit=PendingExit(None, position.quantity, reason, now), broker_error=str(exc))
+        unconfirmed = PendingExit(None, position.quantity, reason, now, checked_at=now)
+        return replace(state, pending_exit=unconfirmed, known_orders=known, broker_error=str(exc))
     logger.info("exit placed", extra={"symbol": position.symbol, "quantity": position.quantity, "reason": reason, "order_id": order_id})
-    return replace(state, pending_exit=PendingExit(order_id, position.quantity, reason, now), known_orders=state.known_orders | {order_id})
+    return replace(state, pending_exit=PendingExit(order_id, position.quantity, reason, now), known_orders=known | {order_id})
 
 
 def _place_entry(state: ExecutionState, broker: Broker, plan: TradePlan, now: pd.Timestamp) -> ExecutionState:
     """Send the limit buy; when OpenD does not confirm it, remember the attempt so it is reconciled, never blindly repeated."""
+    known = _orders_before(state, broker, plan.symbol)
     try:
         order_id = broker.buy_limit(plan.symbol, plan.quantity, plan.limit_price)
     except ConnectionError as exc:
         logger.warning("entry placement unconfirmed; reconciling with the broker next pass", extra={"symbol": plan.symbol, "error": str(exc)})
-        pending = PendingOrder(None, plan.quantity, plan.limit_price, plan.stop, plan.target, now)
-        return replace(state, pending_order=pending, last_candle=plan.candle, broker_error=str(exc))
+        unconfirmed = PendingOrder(None, plan.quantity, plan.limit_price, plan.stop, plan.target, now, checked_at=now)
+        return replace(state, pending_order=unconfirmed, last_candle=plan.candle, known_orders=known, broker_error=str(exc))
     logger.info("entry placed", extra={"symbol": plan.symbol, "quantity": plan.quantity, "limit": plan.limit_price, "order_id": order_id})
     pending = PendingOrder(order_id, plan.quantity, plan.limit_price, plan.stop, plan.target, now)
-    return replace(state, pending_order=pending, last_candle=plan.candle, known_orders=state.known_orders | {order_id})
+    return replace(state, pending_order=pending, last_candle=plan.candle, known_orders=known | {order_id})
 
 
 def _request_cancel(state: ExecutionState, broker: Broker) -> ExecutionState:
@@ -420,12 +462,15 @@ def restore_day(state: ExecutionState, fills: list[Fill], today: datetime.date) 
 def initial_state(broker: Broker, symbol: str, now: pd.Timestamp) -> ExecutionState:
     """Start-up state: today's counters from the fills journal, and shares already held adopted as a halted position.
 
-    The adopted position has no stop or target; it exists so the kill switch
-    can sell exactly what the broker reports, priced against the broker's cost.
+    Every order the broker already reports is marked as known so that a later
+    reconciliation can never adopt one from a previous process or the moomoo
+    app. The adopted position has no stop or target; it exists so the kill
+    switch can sell exactly what the broker reports, priced at the broker's cost.
     """
     state = ExecutionState.fresh()
     if FILLS_JOURNAL.exists():
         state = restore_day(state, load_fills(FILLS_JOURNAL), now.date())
+    state = replace(state, known_orders=_orders_before(state, broker, symbol))
     holding = broker.holding(symbol)
     if holding.quantity > 0:
         position = OpenPosition(symbol, holding.quantity, holding.cost_price, 0.0, math.inf, now)
@@ -515,9 +560,10 @@ def flatten(state: ExecutionState, broker: Broker, symbol: str, now: pd.Timestam
     """One pass toward flat: settle what is open, cancel the entry order once, sell the position once, and halt.
 
     Cancels and fills land asynchronously at the broker, so the caller repeats
-    this until ``is_flat`` holds. A settle that halts for its own reason (an
-    order in an unknown state, shares that left the account) ends the pass
-    without sending anything new.
+    this until ``is_flat`` holds. A settle that halts for its own reason (a
+    rejected sell, shares that left the account) ends the pass without sending
+    anything new; a rejected sell is retried after a pause and at most
+    ``MAX_EXIT_ATTEMPTS`` times before the halt asks for manual reconciliation.
     """
     return _journaled(state, _flatten(state, broker, symbol, now, reason))
 
@@ -533,6 +579,9 @@ def _flatten(state: ExecutionState, broker: Broker, symbol: str, now: pd.Timesta
         state = _settle_exit(state, broker, now)
     if state.halted != reason or state.pending_exit is not None or state.position is None:
         return state
+    block = _exit_retry_block(state, now)
+    if block is not None:
+        return replace(state, halted=f"{reason}: {block}")
     return _place_exit(state, broker, now, reason)
 
 
@@ -572,14 +621,23 @@ def run_executor_forever(
     interval_seconds: float,
     entry_gate: Optional[EntryGate] = None,
 ) -> None:
-    """Poll the store and act; today's counters come from the fills journal and the kill switch flattens and halts."""
-    state = initial_state(broker, symbol, pd.Timestamp.now(tz=NEW_YORK))
-    store.publish_execution(state)
+    """Poll the store and act; today's counters come from the fills journal and the kill switch flattens and halts.
+
+    Start-up queries that fail are retried every pass with the error on the
+    dashboard; any other failure is published as a crash before it propagates.
+    """
+    state: Optional[ExecutionState] = None
     while True:
+        now = pd.Timestamp.now(tz=NEW_YORK)
         try:
-            state = executor_pass(state, store, broker, symbol, pd.Timestamp.now(tz=NEW_YORK), limits, entry_gate)
+            started = initial_state(broker, symbol, now) if state is None else executor_pass(state, store, broker, symbol, now, limits, entry_gate)
+        except ConnectionError as exc:
+            logger.warning("start-up query failed; retrying on the next pass", extra={"symbol": symbol, "error": str(exc)})
+            store.publish_execution(replace(ExecutionState.fresh(), halted=f"starting up, OpenD query failed: {exc}"))
         except Exception as exc:
-            store.publish_execution(replace(state, halted=f"executor crashed: {exc!r}"))
+            store.publish_execution(replace(state if state is not None else ExecutionState.fresh(), halted=f"executor crashed: {exc!r}"))
             raise
-        store.publish_execution(state)
+        else:
+            state = started
+            store.publish_execution(state)
         time.sleep(interval_seconds)

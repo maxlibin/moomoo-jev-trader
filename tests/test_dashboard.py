@@ -221,7 +221,7 @@ def test_execution_api_reports_a_pending_exit_and_broker_errors():
     payload = client.get("/api/execution").get_json()
 
     assert payload["position"]["quantity"] == 10
-    assert payload["pending_exit"] == {"order_id": "sell-1", "quantity": 10, "reason": "stop", "placed_at": now.isoformat()}
+    assert payload["pending_exit"] == {"order_id": "sell-1", "quantity": 10, "reason": "stop", "placed_at": now.isoformat(), "status": None}
     assert payload["broker_error"] == "OpenD order_list_query failed"
 
 
