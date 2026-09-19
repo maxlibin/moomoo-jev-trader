@@ -150,11 +150,15 @@ def plan_entry(
     )
 
 
-def exit_reason(position: OpenPosition, price: float, now: pd.Timestamp, cutoff: time) -> Optional[str]:
-    """Why an open position should be closed now, or None to keep holding."""
-    if price <= position.stop:
+def exit_reason(position: OpenPosition, price: Optional[float], now: pd.Timestamp, cutoff: time) -> Optional[str]:
+    """Why an open position should be closed now, or None to keep holding.
+
+    The stop and target need a live price; the session cutoff does not, so a
+    quote outage cannot leave a position open overnight.
+    """
+    if price is not None and price <= position.stop:
         return "stop"
-    if price >= position.target:
+    if price is not None and price >= position.target:
         return "target"
     if now.time() >= cutoff:
         return "cutoff"

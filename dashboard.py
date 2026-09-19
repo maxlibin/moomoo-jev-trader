@@ -5,11 +5,12 @@ requires a custom request header that a cross-site page cannot send without a
 CORS preflight this server never approves.
 """
 
+import math
 from typing import Callable, Optional
 
 from flask import Flask, jsonify, render_template_string, request
 
-from executor import ExecutionState
+from executor import ExecutionState, is_flat
 from signals import BUY_SIGNALS, SELL_SIGNALS, Setup
 from state import LiveQuote, SignalStore, Snapshot
 
@@ -130,9 +131,12 @@ function renderExecution(x){
   if(!x){text('execution','Auto trading is not running');$('kill').style.display='none';return}
   text('mode',x.jev_gate_mode||'shadow');text('s-trades',x.trades_today);
   const held=x.position?`${x.position.quantity} shares @ ${x.position.entry_price.toFixed(2)} · P&L ${x.daily_pnl.toFixed(2)}`:null;
-  let msg=x.halted?'STOPPED · '+x.halted+(held?' · still holding '+held:''):x.pending_exit?`Selling ${x.pending_exit.quantity} shares (${x.pending_exit.reason})`:held?held:x.pending_order?`Limit buy ${x.pending_order.quantity} @ ${x.pending_order.limit_price.toFixed(2)}`:'Watching for entries';
+  const unconfirmed=o=>o&&!o.order_id?' · confirming with the broker':'';
+  let msg=x.halted?'STOPPED · '+x.halted+(held?' · still holding '+held:''):x.pending_exit?`Selling ${x.pending_exit.quantity} shares (${x.pending_exit.reason})`+unconfirmed(x.pending_exit):held?held:x.pending_order?`Limit buy ${x.pending_order.quantity} @ ${x.pending_order.limit_price.toFixed(2)}`+unconfirmed(x.pending_order):'Watching for entries';
+  if(x.pending_exit&&x.halted)msg+=` · selling ${x.pending_exit.quantity} shares`+unconfirmed(x.pending_exit);
   if(x.broker_error)msg+=' · broker error: '+x.broker_error;
-  text('execution',x.environment+' · '+msg+(x.last_skip?' · '+x.last_skip:''));$('kill').style.display='inline-block'}
+  const open=x.position||x.pending_order||x.pending_exit;
+  text('execution',x.environment+' · '+msg+(x.last_skip?' · '+x.last_skip:''));$('kill').style.display=x.halted&&!open?'none':'inline-block'}
 async function refreshSetup(){try{const r=await fetch('/api/data',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||'setup unavailable');errors.setup=null;setupData=d;renderSetup(d)}catch(e){errors.setup=e.message}showErrors()}
 async function refreshLive(){try{const r=await fetch('/api/live',{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||'live data unavailable');errors.live=null;errors.quote=d.latest_quote_error;liveData=d;renderReview(d.latest_review);renderFeed(d.reviews);renderStrip(d.reviews);renderChart(d.bars,d.reviews,d.latest_quote);text('s-calls',d.review_count);if(d.latest_quote_error){$('dot').className='dot off';text('connection','feed error')}renderExecution(d.execution)}catch(e){$('dot').className='dot off';text('connection','reconnecting');errors.live=e.message}showErrors()}
 $('kill').addEventListener('click',async()=>{if(confirm('Cancel entries, flatten the position, and stop trading?'))await fetch('/api/flatten',{method:'POST',headers:{'{{ flatten_header }}':'{{ flatten_header_value }}'}})});
@@ -187,6 +191,11 @@ def quote_payload(quote: LiveQuote) -> dict:
     }
 
 
+def _level(value: float) -> Optional[float]:
+    """A stop or target, or None when the position has none (an adopted holding uses non-finite levels)."""
+    return value if math.isfinite(value) else None
+
+
 def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: str = "shadow") -> dict:
     position, pending, exiting = state.position, state.pending_order, state.pending_exit
     return {
@@ -194,8 +203,8 @@ def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: st
         "broker_error": state.broker_error,
         "last_skip": state.last_skip, "trades_today": state.trades_today, "daily_pnl": state.daily_pnl,
         "position": None if position is None else {
-            "quantity": position.quantity, "entry_price": position.entry_price, "stop": position.stop,
-            "target": position.target, "opened_at": position.opened_at.isoformat(),
+            "quantity": position.quantity, "entry_price": position.entry_price, "stop": _level(position.stop),
+            "target": _level(position.target), "opened_at": position.opened_at.isoformat(),
         },
         "pending_order": None if pending is None else {
             "order_id": pending.order_id, "quantity": pending.quantity,
@@ -292,7 +301,12 @@ def create_app(store: SignalStore, review: Callable[[Snapshot], dict], environme
                 error=f"the kill switch requires the header {FLATTEN_HEADER}: {FLATTEN_HEADER_VALUE}; "
                 "a page on another origin cannot send it, which is what keeps cross-site pages from flattening the account"
             ), 403
+        state = store.latest_execution()
         store.pull_kill_switch()
-        return jsonify(status="kill switch pulled; the executor flattens on its next pass")
+        if state is None:
+            return jsonify(status="kill switch pulled, but auto trading is not running so there is nothing to flatten")
+        if state.halted is not None and is_flat(state):
+            return jsonify(status=f"already stopped ({state.halted}) with nothing open; there is nothing to flatten")
+        return jsonify(status="kill switch pulled; the executor flattens on its next pass and keeps going until nothing is open")
 
     return app

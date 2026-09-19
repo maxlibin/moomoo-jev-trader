@@ -78,7 +78,7 @@ Useful official references:
 - [OpenAPI quick start](https://openapi.moomoo.com/moomoo-api-doc/en/quick/started.html)
 - [Python API documentation](https://openapi.moomoo.com/moomoo-api-doc/en/)
 
-Moomoo rate-limits its trade queries (about ten account or order queries per 30 seconds). The executor reads the account only when a new entry is possible and re-reads an open order every four seconds; a rejected or failed OpenD call is shown on the dashboard as a broker error and retried on the next pass rather than stopping risk management.
+Moomoo rate-limits its trade queries (about ten account or order queries per 30 seconds). The executor asks Jev before it reads the account, reads the account only when a new entry is possible, and re-reads an open order every four seconds. A failed OpenD query is shown on the dashboard as a broker error and retried on the next pass rather than stopping risk management. A failed order *placement* is never simply re-sent: OpenD's client gives up after 12 seconds even when the order was accepted, so the executor first looks for the order in the broker's order list and adopts it, re-sends a sell only when the broker still shows every tracked share, and skips an entry it cannot find.
 
 ### Optional macOS command-line launcher
 
@@ -218,9 +218,11 @@ The executor is long-only and includes:
 - Daily loss limit
 - Limit-entry timeout
 - Fee-aware minimum expected gain
-- Stop, target, and end-of-session exits
-- Exit orders tracked until the broker confirms the fill; an exit that dies unfilled halts the executor with the shares still shown on the dashboard
-- Daily trade count and loss restored from `logs/fills.csv` on restart, so restarting cannot reset the limits
+- Stop, target, and end-of-session exits; the cutoff exit fires even while the quote feed is down
+- Exit orders tracked until the broker confirms the fill; an exit that dies unfilled, or sits in OpenD's `TIMEOUT` state, halts the executor with the shares still shown on the dashboard
+- Unconfirmed placements reconciled against the broker's order list instead of being re-sent
+- Daily trade count and realised loss restored from `logs/fills.csv` on restart (sells matched to buys), so restarting cannot reset the limits; a buy with no journaled sell blocks the day until the journal is corrected
+- Shares already in the account at start-up stop the strategy; the kill switch sells exactly what the broker reports
 - Browser kill switch that cancels entries, flattens, and keeps flattening until the broker reports nothing open; the endpoint only accepts requests from the dashboard page on localhost
 
 Review `.env.example` for every setting.

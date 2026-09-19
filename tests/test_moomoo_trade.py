@@ -36,7 +36,7 @@ def test_account_and_position_read_from_the_simulated_account(broker: MoomooBrok
 
     assert account.equity > 0
     assert account.cash > 0
-    assert broker.position_quantity("SPCX") >= 0
+    assert broker.holding("SPCX").quantity >= 0
 
 
 @needs_gateway

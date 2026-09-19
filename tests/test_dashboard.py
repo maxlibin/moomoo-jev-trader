@@ -223,3 +223,40 @@ def test_execution_api_reports_a_pending_exit_and_broker_errors():
     assert payload["position"]["quantity"] == 10
     assert payload["pending_exit"] == {"order_id": "sell-1", "quantity": 10, "reason": "stop", "placed_at": now.isoformat()}
     assert payload["broker_error"] == "OpenD order_list_query failed"
+
+
+def test_flatten_says_so_when_there_is_nothing_left_to_flatten():
+    from dataclasses import replace
+
+    from executor import ExecutionState
+
+    store = SignalStore()
+    client = create_app(store, review=lambda snapshot: {"verdict": "WAIT"}).test_client()
+    headers = {FLATTEN_HEADER: FLATTEN_HEADER_VALUE}
+
+    assert "not running" in client.post("/api/flatten", headers=headers).get_json()["status"]
+
+    store.publish_execution(replace(ExecutionState.fresh(), halted="kill switch"))
+    assert "nothing to flatten" in client.post("/api/flatten", headers=headers).get_json()["status"]
+
+    store.publish_execution(ExecutionState.fresh())
+    assert "keeps going until nothing is open" in client.post("/api/flatten", headers=headers).get_json()["status"]
+    assert store.kill_switch_pulled() is True
+
+
+def test_execution_api_serialises_an_adopted_holding_without_levels():
+    import math
+    from dataclasses import replace
+
+    from executor import ExecutionState
+    from trader import OpenPosition
+
+    store = SignalStore()
+    now = pd.Timestamp("2026-09-15 09:31:00", tz=NEW_YORK)
+    store.publish_execution(replace(ExecutionState.fresh(), position=OpenPosition("SPCX", 25, 140.0, 0.0, math.inf, now), halted="already held"))
+    client = create_app(store, review=lambda snapshot: {"verdict": "WAIT"}).test_client()
+
+    payload = client.get("/api/live").get_json()
+
+    assert payload["execution"]["position"]["quantity"] == 25
+    assert payload["execution"]["position"]["target"] is None

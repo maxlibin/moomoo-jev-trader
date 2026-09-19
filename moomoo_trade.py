@@ -20,7 +20,7 @@ from moomoo import (
     TrdSide,
 )
 
-from executor import Account, OrderState
+from executor import Account, BrokerOrder, Holding, OrderState
 from moomoo_feed import moomoo_code
 
 
@@ -67,13 +67,32 @@ class MoomooBroker:
         row = data.iloc[0]
         return Account(equity=float(row["total_assets"]), cash=float(row["cash"]))
 
-    def position_quantity(self, symbol: str) -> int:
+    def holding(self, symbol: str) -> Holding:
+        """Shares held and their average cost, zero when the account has none."""
         code = moomoo_code(symbol)
         ret, data = self._require_context().position_list_query(code=code, trd_env=self._environment)
         if ret != RET_OK:
             raise ConnectionError(f"OpenD position_list_query failed for {code} ({self._environment}): {data}")
-        held = data.loc[data["code"] == code, "qty"]
-        return int(held.sum()) if not held.empty else 0
+        rows = data.loc[data["code"] == code]
+        quantity = int(rows["qty"].sum()) if not rows.empty else 0
+        if quantity <= 0:
+            return Holding(0, 0.0)
+        return Holding(quantity, float((rows["cost_price"] * rows["qty"]).sum() / quantity))
+
+    def orders(self, symbol: str) -> list[BrokerOrder]:
+        """Today's orders for ``symbol`` as OpenD reports them, newest first."""
+        code = moomoo_code(symbol)
+        ret, data = self._require_context().order_list_query(code=code, trd_env=self._environment)
+        if ret != RET_OK:
+            raise ConnectionError(f"OpenD order_list_query failed for {code} ({self._environment}): {data}")
+        rows = data.loc[data["code"] == code].sort_values("create_time", ascending=False)
+        return [
+            BrokerOrder(
+                order_id=str(row["order_id"]), side=str(row["trd_side"]), quantity=int(row["qty"]), price=float(row["price"]),
+                status=str(row["order_status"]), filled_quantity=int(row["dealt_qty"]), average_price=float(row["dealt_avg_price"]),
+            )
+            for _, row in rows.iterrows()
+        ]
 
     def _place(self, symbol: str, quantity: int, side: TrdSide, order_type: OrderType, price: float) -> str:
         code = moomoo_code(symbol)
