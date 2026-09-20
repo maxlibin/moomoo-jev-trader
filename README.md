@@ -7,6 +7,12 @@ The application reads real one-minute OHLCV candles and live quotes from Moomoo,
 > [!WARNING]
 > Experimental software—not financial advice. Start with Moomoo's `SIMULATE` environment and Jev `shadow` mode. No model probability demonstrates a profitable trading edge.
 
+## Dashboard preview
+
+![Moomoo Jev Trader live dashboard](docs/dashboard.png)
+
+*Preview captured with deterministic synthetic candles and simulated execution to showcase the interface without exposing brokerage data.*
+
 ## Inspiration
 
 This project was inspired by [jarrodwatts/jev-trader](https://github.com/jarrodwatts/jev-trader), which demonstrates fast TypeSafe Jev decisions against a live crypto order book. Moomoo Jev Trader adapts that idea to US equities with:
