@@ -4,8 +4,8 @@ Run from the project's ``.venv`` while OpenD is running and logged in::
 
     python run_live.py
 
-Settings come from ``.env``: MOOMOO_HOST and MOOMOO_PORT for the gateway,
-WATCH_SYMBOL and WATCH_BENCHMARK for the instruments.
+Settings come from ``.env``; ``.env.example`` documents every variable and
+its safe default.
 """
 
 import os

@@ -192,3 +192,43 @@ def test_gate_mode_accepts_only_shadow_or_enforce():
     assert gate_mode_from_env({"JEV_ENTRY_GATE_MODE": " Enforce "}) == "enforce"
     with pytest.raises(ValueError, match="JEV_ENTRY_GATE_MODE.*'enforced'"):
         gate_mode_from_env({"JEV_ENTRY_GATE_MODE": "enforced"})
+
+
+class StopLoop(Exception):
+    """Raised from the patched sleep to end ``run_jev_forever``."""
+
+
+def test_jev_loop_reviews_every_interval_and_pauses_on_a_stale_quote(monkeypatch):
+    from dataclasses import replace
+
+    import ai_analysis
+    from ai_analysis import run_jev_forever
+    from state import SignalStore
+
+    snapshot = evaluated_snapshot()
+    now = pd.Timestamp.now(tz="UTC")
+    store = SignalStore()
+    store.publish(snapshot)
+    store.publish_quote(replace(live_quote(snapshot), quoted_at=now))
+    client = FakeClient()
+    journaled, sleeps, clock = [], [], {"now": 1000.0}
+    monkeypatch.setattr(ai_analysis, "append_review", journaled.append)
+    monkeypatch.setattr(ai_analysis.time, "monotonic", lambda: clock["now"])
+
+    def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+        if len(sleeps) == 2:
+            store.publish_quote(replace(live_quote(snapshot), quoted_at=now - pd.Timedelta(minutes=5)))
+        if len(sleeps) == 3:
+            raise StopLoop
+
+    monkeypatch.setattr(ai_analysis.time, "sleep", sleep)
+
+    with pytest.raises(StopLoop):
+        run_jev_forever(store, 5.0, JevReviewer(client, DEFAULT_SETTINGS))
+
+    assert sleeps == [5.0, 5.0, 5.0]
+    assert len(client.calls) == 2 and len(journaled) == 2 and store.jev_completed() == 2
+    latest = store.latest_jev()
+    assert latest["status"] == "idle" and "stale" in latest["summary"] and "300s old" in latest["summary"]
