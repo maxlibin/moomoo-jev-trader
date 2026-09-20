@@ -600,11 +600,66 @@ def test_decide_never_enters_or_exits_on_a_stale_quote_but_still_exits_at_the_cu
     decision = decide(holding, snapshot, stale_stop, at_cutoff, counted, DEFAULT_LIMITS)
     assert isinstance(decision, Exit) and decision.reason == "cutoff"
 
+    future_stop = quote_at(setup.stop - 0.01, t0 + 3 * SECONDS)
+    assert isinstance(decide(holding, snapshot, future_stop, t0, counted, DEFAULT_LIMITS), Nothing)
+    assert isinstance(decide(holding, snapshot, quote_at(setup.stop - 0.01, t0 + 2 * SECONDS), t0, counted, DEFAULT_LIMITS), Exit)
+
     flat = ExecutionState.fresh()
     assert isinstance(decide(flat, snapshot, quote_at(setup.price, t0), t0 + limit + SECONDS, counted, DEFAULT_LIMITS), Nothing)
+    assert isinstance(decide(flat, snapshot, quote_at(setup.price, t0 + 3 * SECONDS), t0, counted, DEFAULT_LIMITS), Nothing)
     assert reads == []
     assert isinstance(decide(flat, snapshot, quote_at(setup.price, t0 + limit), t0 + limit + SECONDS, counted, DEFAULT_LIMITS), Enter)
     assert reads == [1]
+
+
+def test_step_reports_stop_and_target_suspended_while_the_held_quote_is_not_current():
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = SignalStore()
+    store.publish(snapshot)
+    position = held_position(setup, t0)
+    state = replace(ExecutionState.fresh(), position=position, last_candle=setup.timestamp)
+    broker = ScriptedBroker({"sell-1": [OrderState("FILLED_ALL", 10, setup.stop - 0.02)]})
+
+    store.publish_quote(quote_at(setup.stop - 0.01, t0 - 5 * pd.Timedelta(minutes=1)))
+    stale = step(state, store, broker, "SPCX", t0, DEFAULT_LIMITS)
+    assert stale.position == position and stale.pending_exit is None and broker.sells == []
+    assert stale.price_exits_suspended == "quote is 300s old, over the 60s limit"
+
+    store.publish_quote(quote_at(setup.stop - 0.01, t0 + 10 * SECONDS))
+    future = step(stale, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS)
+    assert future.pending_exit is None and broker.sells == []
+    assert future.price_exits_suspended == "quote is stamped 8s in the future; check the clock and time zone"
+
+    store.publish_quote(quote_at(setup.price + 0.5, t0 + 4 * SECONDS))
+    current = step(future, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS)
+    assert current.price_exits_suspended is None and current.pending_exit is None and broker.sells == []
+
+    store.publish_quote(quote_at(setup.stop - 0.01, t0 + 6 * SECONDS))
+    stopped = step(current, store, broker, "SPCX", t0 + 6 * SECONDS, DEFAULT_LIMITS)
+    assert stopped.pending_exit.reason == "stop" and stopped.price_exits_suspended is None and broker.sells == [("SPCX", 10)]
+
+
+def test_step_still_sends_the_cutoff_exit_and_flattens_while_the_quote_is_stale():
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = SignalStore()
+    store.publish(snapshot)
+    store.publish_quote(quote_at(setup.stop - 0.01, t0 - 5 * pd.Timedelta(minutes=1)))
+    state = replace(ExecutionState.fresh(), position=held_position(setup, t0), last_candle=setup.timestamp)
+    broker = ScriptedBroker({"sell-1": [OrderState("FILLED_ALL", 10, setup.stop - 0.02)]})
+
+    at_cutoff = pd.Timestamp("2026-09-15 15:50:00", tz=NEW_YORK)
+    cut = step(state, store, broker, "SPCX", at_cutoff, DEFAULT_LIMITS)
+    assert cut.pending_exit.reason == "cutoff" and cut.price_exits_suspended is None and broker.sells == [("SPCX", 10)]
+
+    suspended = step(state, store, broker, "SPCX", t0, DEFAULT_LIMITS)
+    assert suspended.price_exits_suspended is not None
+    store.pull_kill_switch()
+    killed = executor_pass(suspended, store, ScriptedBroker({"sell-1": [OrderState("SUBMITTED", 0, 0.0)]}), "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS, None)
+    assert killed.halted == "kill switch" and killed.pending_exit.reason == "kill switch" and killed.price_exits_suspended is None
 
 
 def test_step_waits_for_a_fresh_quote_before_entering_without_consuming_the_candle():

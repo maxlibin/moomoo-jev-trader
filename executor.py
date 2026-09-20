@@ -2,8 +2,10 @@
 
 ``decide`` looks at the execution state, the latest closed-candle snapshot, the
 live quote, and the account, and returns exactly one decision. A quote older
-than ``limits.max_quote_age_seconds`` never drives an entry, a stop, or a
-target; only the session cutoff acts without a fresh price. ``step`` carries
+than ``limits.max_quote_age_seconds`` or stamped ahead of the clock never
+drives an entry, a stop, or a target; only the session cutoff acts without a
+fresh price, and a held position shows its price exits as suspended while the
+quote is not current. ``step`` carries
 the decision out against a ``Broker`` and returns the new state. Entry and exit
 orders are tracked until the broker reports them filled or dead, so the state
 never claims to be flat while shares are still held. An order placement that
@@ -25,7 +27,7 @@ from typing import Callable, Optional, Protocol, Union
 
 import pandas as pd
 
-from state import LiveQuote, SignalStore, Snapshot, quote_age_seconds
+from state import LiveQuote, SignalStore, Snapshot, stale_quote_reason
 from signals import BUY_SIGNALS
 from trader import OpenPosition, RiskLimits, TradePlan, entry_block_reason, exit_reason, plan_entry
 
@@ -93,6 +95,7 @@ class ExecutionState:
     known_orders: frozenset[str] = frozenset()
     exit_failures: int = 0
     last_exit_failure: Optional[pd.Timestamp] = None
+    price_exits_suspended: Optional[str] = None
 
     @staticmethod
     def fresh() -> "ExecutionState":
@@ -185,24 +188,14 @@ def entry_window_open(state: ExecutionState, snapshot: Snapshot) -> bool:
     )
 
 
-def quote_block_reason(quote: LiveQuote, now: pd.Timestamp, max_age_seconds: float) -> Optional[str]:
-    """Why the live price must not drive an entry, stop, or target: the feed failed, or the exchange stamp is too old.
-
-    OpenD answers with its last known quote during an upstream outage and with
-    delayed data on a delayed entitlement, so the exchange stamp, not the
-    gateway's answer, decides whether the price is current.
-    """
-    age = quote_age_seconds(quote, now)
-    if quote.price is None or age is None:
-        return f"no live quote: {quote.error}" if quote.error is not None else "no live quote"
-    if age > max_age_seconds:
-        return f"quote is {age:.0f}s old, over the {max_age_seconds:.0f}s limit"
-    return None
-
-
 def usable_price(quote: LiveQuote, now: pd.Timestamp, max_age_seconds: float) -> Optional[float]:
-    """The live price when it is fresh enough to act on, otherwise None."""
-    return None if quote_block_reason(quote, now, max_age_seconds) is not None else quote.price
+    """The live price when it is current enough to act on, otherwise None."""
+    return None if stale_quote_reason(quote, now, max_age_seconds) is not None else quote.price
+
+
+def guarding_levels(state: ExecutionState) -> bool:
+    """True while ``decide`` is the only thing watching the position's stop and target."""
+    return state.halted is None and state.position is not None and state.pending_exit is None
 
 
 def decide(
@@ -537,7 +530,7 @@ def _step(
     limits: RiskLimits,
     entry_gate: Optional[EntryGate] = None,
 ) -> ExecutionState:
-    state = replace(state, broker_error=None)
+    state = replace(state, broker_error=None, price_exits_suspended=None)
     if state.pending_order is not None:
         state = _settle_pending(state, broker, symbol, now)
     if state.pending_exit is not None:
@@ -548,7 +541,7 @@ def _step(
     if snapshot is None or quote is None:
         return state
     state = _roll_day(state, snapshot)
-    quote_block = quote_block_reason(quote, now, limits.max_quote_age_seconds)
+    quote_block = stale_quote_reason(quote, now, limits.max_quote_age_seconds)
     if quote_block is not None and entry_window_open(state, snapshot):
         return replace(state, last_skip=f"{setup_time(snapshot)} waiting: {quote_block}")
     if entry_gate is not None and entry_window_open(state, snapshot):
@@ -568,6 +561,9 @@ def _step(
         return _request_cancel(state, broker)
     if isinstance(decision, Exit):
         return _place_exit(state, broker, now, decision.reason)
+    if quote_block is not None and guarding_levels(state):
+        logger.warning("stop and target suspended on a quote that is not current", extra={"symbol": symbol, "reason": quote_block})
+        return replace(state, price_exits_suspended=quote_block)
     if state.halted is None and state.position is None and snapshot.setup is not None and state.last_candle != snapshot.setup.timestamp:
         setup = snapshot.setup
         skip = state.last_skip
@@ -595,7 +591,7 @@ def flatten(state: ExecutionState, broker: Broker, symbol: str, now: pd.Timestam
 
 
 def _flatten(state: ExecutionState, broker: Broker, symbol: str, now: pd.Timestamp, reason: str) -> ExecutionState:
-    state = replace(state, halted=reason, broker_error=None)
+    state = replace(state, halted=reason, broker_error=None, price_exits_suspended=None)
     if state.pending_order is not None:
         state = _settle_pending(state, broker, symbol, now)
     pending = state.pending_order

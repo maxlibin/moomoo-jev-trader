@@ -134,6 +134,7 @@ function renderExecution(x){
   const unconfirmed=o=>!o?'':!o.order_id?' · confirming with the broker':o.status==='TIMEOUT'?' · TIMEOUT at OpenD, result unknown until it settles (check moomoo)':'';
   let msg=x.halted?'STOPPED · '+x.halted+(held?' · still holding '+held:''):x.pending_exit?`Selling ${x.pending_exit.quantity} shares (${x.pending_exit.reason})`+unconfirmed(x.pending_exit):held?held:x.pending_order?`Limit buy ${x.pending_order.quantity} @ ${x.pending_order.limit_price.toFixed(2)}`+unconfirmed(x.pending_order):'Watching for entries';
   if(x.pending_exit&&x.halted)msg+=` · selling ${x.pending_exit.quantity} shares`+unconfirmed(x.pending_exit);
+  if(x.price_exits_suspended)msg+=' · STOP AND TARGET SUSPENDED, only the cutoff exit is active: '+x.price_exits_suspended;
   if(x.broker_error)msg+=' · broker error: '+x.broker_error;
   const open=x.position||x.pending_order||x.pending_exit;
   text('execution',x.environment+' · '+msg+(x.last_skip?' · '+x.last_skip:''));$('kill').style.display=x.halted&&!open?'none':'inline-block'}
@@ -201,6 +202,7 @@ def execution_payload(state: ExecutionState, environment: str, jev_gate_mode: st
     return {
         "environment": environment, "jev_gate_mode": jev_gate_mode, "halted": state.halted,
         "broker_error": state.broker_error,
+        "price_exits_suspended": state.price_exits_suspended,
         "last_skip": state.last_skip, "trades_today": state.trades_today, "daily_pnl": state.daily_pnl,
         "position": None if position is None else {
             "quantity": position.quantity, "entry_price": position.entry_price, "stop": _level(position.stop),

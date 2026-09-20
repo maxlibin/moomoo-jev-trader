@@ -223,6 +223,10 @@ def test_execution_api_reports_a_pending_exit_and_broker_errors():
     assert payload["position"]["quantity"] == 10
     assert payload["pending_exit"] == {"order_id": "sell-1", "quantity": 10, "reason": "stop", "placed_at": now.isoformat(), "status": None}
     assert payload["broker_error"] == "OpenD order_list_query failed"
+    assert payload["price_exits_suspended"] is None
+
+    store.publish_execution(replace(ExecutionState.fresh(), position=position, price_exits_suspended="quote is 75s old, over the 60s limit"))
+    assert client.get("/api/execution").get_json()["price_exits_suspended"] == "quote is 75s old, over the 60s limit"
 
 
 def test_flatten_says_so_when_there_is_nothing_left_to_flatten():

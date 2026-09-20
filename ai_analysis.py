@@ -20,7 +20,7 @@ from typesafe_sdk import Choice, Noul, RetryPolicy, TypeSafeClient
 
 from settings import count, name, overrides_from_env, positive, probability
 from signals import BUY_SIGNALS
-from state import LiveQuote, SignalStore, Snapshot, quote_age_seconds
+from state import LiveQuote, SignalStore, Snapshot, stale_quote_reason
 
 
 REVIEWS_JOURNAL = Path(__file__).parent / "logs" / "jev_reviews.jsonl"
@@ -314,9 +314,9 @@ def run_jev_forever(store: SignalStore, interval_seconds: float, reviewer: JevRe
     while True:
         snapshot, quote = store.latest(), store.latest_quote()
         if snapshot is not None and snapshot.error is None and quote is not None and quote.error is None:
-            quote_age = quote_age_seconds(quote, pd.Timestamp.now(tz="UTC"))
-            if quote_age is None or quote_age < -2 or quote_age > settings.max_quote_age_seconds:
-                store.publish_jev(idle_review("Market data is stale; Jev is paused until a fresh exchange quote arrives.", settings.model))
+            stale = stale_quote_reason(quote, pd.Timestamp.now(tz="UTC"), settings.max_quote_age_seconds)
+            if stale is not None:
+                store.publish_jev(idle_review(f"Market data is stale ({stale}); Jev is paused until a fresh exchange quote arrives.", settings.model))
             else:
                 review = reviewer.review(snapshot, quote)
                 store.publish_jev(review)

@@ -56,11 +56,33 @@ class LiveQuote:
     error: Optional[str]
 
 
+FUTURE_STAMP_TOLERANCE_SECONDS = 2.0
+
+
 def quote_age_seconds(quote: LiveQuote, now: pd.Timestamp) -> Optional[float]:
     """Seconds from the exchange stamp to ``now``, or None when the feed gave no stamp."""
     if quote.quoted_at is None:
         return None
     return (now - quote.quoted_at).total_seconds()
+
+
+def stale_quote_reason(quote: LiveQuote, now: pd.Timestamp, max_age_seconds: float) -> Optional[str]:
+    """Why the quote is not current: the feed failed, the stamp is older than the limit, or it is ahead of the clock.
+
+    The exchange stamp, not the gateway's answer, decides: OpenD repeats its
+    last quote during an upstream outage and serves old stamps on a delayed
+    entitlement, and a stamp more than ``FUTURE_STAMP_TOLERANCE_SECONDS`` ahead
+    of ``now`` means a clock or time zone is wrong. The executor and the Jev
+    loop share this rule so they never disagree about the same quote.
+    """
+    age = quote_age_seconds(quote, now)
+    if quote.price is None or age is None:
+        return f"no live quote: {quote.error}" if quote.error is not None else "no live quote"
+    if age < -FUTURE_STAMP_TOLERANCE_SECONDS:
+        return f"quote is stamped {-age:.0f}s in the future; check the clock and time zone"
+    if age > max_age_seconds:
+        return f"quote is {age:.0f}s old, over the {max_age_seconds:.0f}s limit"
+    return None
 
 
 class SignalStore:

@@ -219,14 +219,14 @@ The executor is long-only and includes:
 - Limit-entry timeout
 - Fee-aware minimum expected gain
 - Stop, target, and end-of-session exits; the cutoff exit fires even while the quote feed is down
-- No entry, stop, or target acts on a quote whose exchange stamp is older than `MAX_QUOTE_AGE_SECONDS`, so delayed entitlements and an OpenD gateway repeating its last quote during an outage cannot trigger orders; the wait is shown on the execution line
+- No entry, stop, or target acts on a quote whose exchange stamp is older than `MAX_QUOTE_AGE_SECONDS` or more than two seconds ahead of the clock, so delayed entitlements, an OpenD gateway repeating its last quote during an outage, and a wrong clock or time zone cannot trigger orders. An entry waits with the reason on the execution line; a held position shows its stop and target as suspended there until a current quote arrives, and the cutoff exit still fires. Jev pauses on the same rule
 - Exit orders tracked until the broker confirms the fill; an exit that dies unfilled halts the executor with the shares still shown on the dashboard, and one OpenD reports as `TIMEOUT` is shown as unresolved and re-read until it settles
 - Unconfirmed placements reconciled against the broker's order list instead of being re-sent; a rejected sell is retried after a pause and at most three times before the executor asks for manual reconciliation
 - Daily trade count and realised loss restored from `logs/fills.csv` on restart (sells matched to buys), so restarting cannot reset the limits; a buy with no journaled sell blocks the day until the journal is corrected
 - Shares already in the account at start-up stop the strategy; the kill switch sells exactly what the broker reports
 - Browser kill switch that cancels entries, flattens, and keeps flattening until the broker reports nothing open or the sell has been rejected three times; the endpoint only accepts requests from the dashboard page on localhost
 
-Review `.env.example` for every setting. Each risk and Jev setting is range-checked at start-up; a value outside its range (`RISK_FRACTION=1` would be the whole account per trade) refuses to start with the variable and value named.
+Review `.env.example` for every setting. Each risk and Jev setting is range-checked at start-up, and a value outside its range (`RISK_FRACTION=5`, `MAX_TRADES_PER_DAY=0`, a negative `FEE_PER_ORDER`) refuses to start with the variable and value named. Fractions are shares of the account in (0, 1]: `RISK_FRACTION=0.01` is one percent per trade, and `RISK_FRACTION=1` is accepted and means the whole account per trade.
 
 ## Development
 
