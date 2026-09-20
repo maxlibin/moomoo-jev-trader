@@ -1,14 +1,16 @@
 """Execution state machine: pure ``decide`` plus a thin ``step`` that applies decisions through a broker.
 
 ``decide`` looks at the execution state, the latest closed-candle snapshot, the
-live quote, and the account, and returns exactly one decision. ``step`` carries
-it out against a ``Broker`` and returns the new state. Entry and exit orders are
-tracked until the broker reports them filled or dead, so the state never claims
-to be flat while shares are still held. An order placement that OpenD does not
-confirm is reconciled against the broker's order list before anything is sent
-again. ``run_executor_forever`` polls the store every couple of seconds, records
-broker failures instead of dying on them, and keeps flattening while the kill
-switch is pulled until nothing is left open.
+live quote, and the account, and returns exactly one decision. A quote older
+than ``limits.max_quote_age_seconds`` never drives an entry, a stop, or a
+target; only the session cutoff acts without a fresh price. ``step`` carries
+the decision out against a ``Broker`` and returns the new state. Entry and exit
+orders are tracked until the broker reports them filled or dead, so the state
+never claims to be flat while shares are still held. An order placement that
+OpenD does not confirm is reconciled against the broker's order list before
+anything is sent again. ``run_executor_forever`` polls the store every couple
+of seconds, records failures instead of dying on them, and keeps flattening
+while the kill switch is pulled until nothing is left open.
 """
 
 import csv
@@ -23,7 +25,7 @@ from typing import Callable, Optional, Protocol, Union
 
 import pandas as pd
 
-from state import LiveQuote, SignalStore, Snapshot
+from state import LiveQuote, SignalStore, Snapshot, quote_age_seconds
 from signals import BUY_SIGNALS
 from trader import OpenPosition, RiskLimits, TradePlan, entry_block_reason, exit_reason, plan_entry
 
@@ -183,6 +185,26 @@ def entry_window_open(state: ExecutionState, snapshot: Snapshot) -> bool:
     )
 
 
+def quote_block_reason(quote: LiveQuote, now: pd.Timestamp, max_age_seconds: float) -> Optional[str]:
+    """Why the live price must not drive an entry, stop, or target: the feed failed, or the exchange stamp is too old.
+
+    OpenD answers with its last known quote during an upstream outage and with
+    delayed data on a delayed entitlement, so the exchange stamp, not the
+    gateway's answer, decides whether the price is current.
+    """
+    age = quote_age_seconds(quote, now)
+    if quote.price is None or age is None:
+        return f"no live quote: {quote.error}" if quote.error is not None else "no live quote"
+    if age > max_age_seconds:
+        return f"quote is {age:.0f}s old, over the {max_age_seconds:.0f}s limit"
+    return None
+
+
+def usable_price(quote: LiveQuote, now: pd.Timestamp, max_age_seconds: float) -> Optional[float]:
+    """The live price when it is fresh enough to act on, otherwise None."""
+    return None if quote_block_reason(quote, now, max_age_seconds) is not None else quote.price
+
+
 def decide(
     state: ExecutionState,
     snapshot: Snapshot,
@@ -200,10 +222,11 @@ def decide(
         if pending.order_id is not None and not pending.cancel_requested and timed_out:
             return CancelEntry(pending.order_id)
         return Nothing()
+    price = usable_price(quote, now, limits.max_quote_age_seconds)
     if state.position is not None:
-        reason = exit_reason(state.position, quote.price, now, limits.cutoff)
+        reason = exit_reason(state.position, price, now, limits.cutoff)
         return Exit(reason) if reason is not None else Nothing()
-    if not entry_window_open(state, snapshot):
+    if price is None or not entry_window_open(state, snapshot):
         return Nothing()
     funds = account()
     plan = plan_entry(snapshot.setup, snapshot.symbol, funds.equity, funds.cash, state.trades_today, state.daily_pnl, limits)
@@ -525,6 +548,9 @@ def _step(
     if snapshot is None or quote is None:
         return state
     state = _roll_day(state, snapshot)
+    quote_block = quote_block_reason(quote, now, limits.max_quote_age_seconds)
+    if quote_block is not None and entry_window_open(state, snapshot):
+        return replace(state, last_skip=f"{setup_time(snapshot)} waiting: {quote_block}")
     if entry_gate is not None and entry_window_open(state, snapshot):
         approved, reason = entry_gate(snapshot, now)
         if approved is None:
@@ -624,7 +650,10 @@ def run_executor_forever(
     """Poll the store and act; today's counters come from the fills journal and the kill switch flattens and halts.
 
     Start-up queries that fail are retried every pass with the error on the
-    dashboard; any other failure is published as a crash before it propagates.
+    dashboard. Any other failure is logged with its traceback and shown on the
+    dashboard, and the same state is retried on the next pass: the thread never
+    ends while the process runs, so the cutoff exit and the kill switch stay in
+    service for whatever is held.
     """
     state: Optional[ExecutionState] = None
     while True:
@@ -635,8 +664,11 @@ def run_executor_forever(
             logger.warning("start-up query failed; retrying on the next pass", extra={"symbol": symbol, "error": str(exc)})
             store.publish_execution(replace(ExecutionState.fresh(), halted=f"starting up, OpenD query failed: {exc}"))
         except Exception as exc:
-            store.publish_execution(replace(state if state is not None else ExecutionState.fresh(), halted=f"executor crashed: {exc!r}"))
-            raise
+            logger.exception("executor pass failed; retrying on the next pass with the same state", extra={"symbol": symbol})
+            if state is None:
+                store.publish_execution(replace(ExecutionState.fresh(), halted=f"starting up, unexpected {exc!r}; retrying"))
+            else:
+                store.publish_execution(replace(state, broker_error=f"unexpected {exc!r}; the pass is retried"))
         else:
             state = started
             store.publish_execution(state)

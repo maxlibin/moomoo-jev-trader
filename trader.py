@@ -7,12 +7,13 @@ price crossing the stop or target, or at the session cutoff.
 """
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import time
 from typing import Mapping, Optional
 
 import pandas as pd
 
+from settings import count, fraction, non_negative, overrides_from_env, positive
 from signals import BUY_SIGNALS, Setup
 
 
@@ -29,6 +30,7 @@ class RiskLimits:
     fee_per_order: float
     min_gain_to_fee_ratio: float
     sizing_equity_cap: float
+    max_quote_age_seconds: float
 
 
 DEFAULT_LIMITS = RiskLimits(
@@ -43,25 +45,26 @@ DEFAULT_LIMITS = RiskLimits(
     fee_per_order=1.10,
     min_gain_to_fee_ratio=3.0,
     sizing_equity_cap=5_000.0,
+    max_quote_age_seconds=60.0,
 )
 
 
 ENV_LIMIT_FIELDS = {
-    "RISK_FRACTION": ("risk_fraction", float),
-    "MAX_POSITION_FRACTION": ("max_position_fraction", float),
-    "MAX_TRADES_PER_DAY": ("max_trades_per_day", int),
-    "MAX_DAILY_LOSS_FRACTION": ("max_daily_loss_fraction", float),
-    "ENTRY_TIMEOUT_SECONDS": ("entry_timeout_seconds", int),
-    "FEE_PER_ORDER": ("fee_per_order", float),
-    "MIN_GAIN_TO_FEE_RATIO": ("min_gain_to_fee_ratio", float),
-    "SIZING_EQUITY_CAP": ("sizing_equity_cap", float),
+    "RISK_FRACTION": ("risk_fraction", fraction),
+    "MAX_POSITION_FRACTION": ("max_position_fraction", fraction),
+    "MAX_TRADES_PER_DAY": ("max_trades_per_day", count),
+    "MAX_DAILY_LOSS_FRACTION": ("max_daily_loss_fraction", fraction),
+    "ENTRY_TIMEOUT_SECONDS": ("entry_timeout_seconds", count),
+    "FEE_PER_ORDER": ("fee_per_order", non_negative),
+    "MIN_GAIN_TO_FEE_RATIO": ("min_gain_to_fee_ratio", non_negative),
+    "SIZING_EQUITY_CAP": ("sizing_equity_cap", positive),
+    "MAX_QUOTE_AGE_SECONDS": ("max_quote_age_seconds", positive),
 }
 
 
 def limits_from_env(env: Mapping[str, str], base: RiskLimits) -> RiskLimits:
-    """``base`` with any of the ENV_LIMIT_FIELDS variables present in ``env`` applied."""
-    overrides = {field: cast(env[name]) for name, (field, cast) in ENV_LIMIT_FIELDS.items() if name in env}
-    return replace(base, **overrides)
+    """``base`` with any of the ENV_LIMIT_FIELDS variables present in ``env`` applied; a value outside its safe range refuses to start."""
+    return overrides_from_env(env, ENV_LIMIT_FIELDS, base)
 
 
 @dataclass(frozen=True)
@@ -153,8 +156,8 @@ def plan_entry(
 def exit_reason(position: OpenPosition, price: Optional[float], now: pd.Timestamp, cutoff: time) -> Optional[str]:
     """Why an open position should be closed now, or None to keep holding.
 
-    The stop and target need a live price; the session cutoff does not, so a
-    quote outage cannot leave a position open overnight.
+    The stop and target need a fresh live price; the session cutoff does not,
+    so a quote outage or a stale feed cannot leave a position open overnight.
     """
     if price is not None and price <= position.stop:
         return "stop"

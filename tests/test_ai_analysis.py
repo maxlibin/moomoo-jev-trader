@@ -7,7 +7,16 @@ import pytest
 
 from pathlib import Path
 
-from ai_analysis import JevReviewer, append_review, build_state, gate_decision, gate_mode_from_env
+from ai_analysis import (
+    DEFAULT_SETTINGS,
+    JevReviewer,
+    append_review,
+    build_state,
+    gate_decision,
+    gate_mode_from_env,
+    reviewer_from_env,
+    settings_from_env,
+)
 from bars_csv import load_bars_csv
 from signals import DEFAULT_CONFIG, evaluate, indicator_frame
 from state import Candle, LiveQuote, Snapshot
@@ -73,22 +82,24 @@ def live_quote(snapshot):
 
 def test_build_state_includes_recent_bars_and_live_evidence():
     snapshot = evaluated_snapshot()
-    state = build_state(snapshot, live_quote(snapshot))
+    state = build_state(snapshot, live_quote(snapshot), DEFAULT_SETTINGS.recent_bars)
 
     assert state["candidate"]["completed_candle"] == snapshot.setup.timestamp.isoformat()
     assert state["live"]["forming_candle"]["volume"] == 1200
     assert 1 <= len(state["recent_completed_bars"]) <= 30
+    assert len(build_state(snapshot, live_quote(snapshot), 3)["recent_completed_bars"]) == 3
     assert state["recent_completed_bars"][-1]["close"] == pytest.approx(snapshot.setup.price, abs=1e-6)
 
 
 def test_review_uses_typed_probabilities_to_approve_candidate(monkeypatch):
     from dataclasses import replace
 
+    monkeypatch.setenv("JEV_MIN_UP_PROBABILITY", "0.99")
     snapshot = evaluated_snapshot()
     snapshot = replace(snapshot, setup=replace(snapshot.setup, signal="BUY SETUP"))
     client = FakeClient()
 
-    review = JevReviewer(client).review(snapshot, live_quote(snapshot))
+    review = JevReviewer(client, DEFAULT_SETTINGS).review(snapshot, live_quote(snapshot))
 
     assert len(client.calls) == 1
     assert review["status"] == "complete"
@@ -103,10 +114,47 @@ def test_review_rejects_when_stop_first_risk_is_high():
     snapshot = evaluated_snapshot()
     snapshot = replace(snapshot, setup=replace(snapshot.setup, signal="BUY SETUP"))
 
-    review = JevReviewer(FakeClient(stop_first=0.8)).review(snapshot, live_quote(snapshot))
+    review = JevReviewer(FakeClient(stop_first=0.8), DEFAULT_SETTINGS).review(snapshot, live_quote(snapshot))
 
     assert review["approved"] is False
     assert any("Stop-first" in risk for risk in review["risks"])
+
+
+def test_thresholds_come_from_the_settings_the_reviewer_was_given():
+    from dataclasses import replace
+
+    snapshot = evaluated_snapshot()
+    snapshot = replace(snapshot, setup=replace(snapshot.setup, signal="BUY SETUP"))
+    strict = settings_from_env({"JEV_MIN_UP_PROBABILITY": "0.80", "JEV_MODEL": " jev-strict "})
+
+    review = JevReviewer(FakeClient(up=0.72), strict).review(snapshot, live_quote(snapshot))
+
+    assert strict.model == "jev-strict" and strict.min_quality_probability == DEFAULT_SETTINGS.min_quality_probability
+    assert review["approved"] is False
+    assert any("72% is below 80%" in risk for risk in review["risks"])
+
+
+def test_settings_from_env_names_the_variable_and_value_it_rejects():
+    for variable, value in (
+        ("JEV_MIN_UP_PROBABILITY", "1.5"),
+        ("JEV_MAX_STOP_FIRST_PROBABILITY", "-0.1"),
+        ("JEV_MAX_QUOTE_AGE_SECONDS", "0"),
+        ("JEV_TIMEOUT_SECONDS", "soon"),
+        ("JEV_RECENT_BARS", "0"),
+        ("JEV_MODEL", "  "),
+    ):
+        with pytest.raises(ValueError, match=f"{variable}={value!r}"):
+            settings_from_env({variable: value})
+
+
+def test_reviewer_from_env_is_disabled_without_an_api_key():
+    reviewer = reviewer_from_env({"TYPESAFE_API_KEY": "  ", "JEV_MODEL": "jev-next"})
+    snapshot = evaluated_snapshot()
+
+    review = reviewer.review(snapshot, live_quote(snapshot))
+
+    assert reviewer.client is None
+    assert review["status"] == "disabled" and review["model"] == "jev-next"
 
 
 def test_completed_reviews_are_journaled_for_shadow_analysis(tmp_path):
@@ -130,11 +178,13 @@ def test_gate_requires_a_fresh_review_for_the_same_candle():
         "evaluated_at": now.tz_convert("UTC").isoformat(),
     }
 
-    assert gate_decision(review, snapshot, now) == (True, "Jev entry gate passed")
+    max_age = DEFAULT_SETTINGS.max_gate_age_seconds
+    assert gate_decision(review, snapshot, now, max_age) == (True, "Jev entry gate passed")
     old = {**review, "evaluated_at": (now - pd.Timedelta(seconds=60)).tz_convert("UTC").isoformat()}
-    assert gate_decision(old, snapshot, now)[0] is None
+    assert gate_decision(old, snapshot, now, max_age)[0] is None
+    assert gate_decision(old, snapshot, now, 90.0)[0] is True
     wrong = {**review, "candle": "2026-09-15T14:58:00-04:00"}
-    assert gate_decision(wrong, snapshot, now)[0] is None
+    assert gate_decision(wrong, snapshot, now, max_age)[0] is None
 
 
 def test_gate_mode_accepts_only_shadow_or_enforce():

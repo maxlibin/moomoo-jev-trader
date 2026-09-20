@@ -298,12 +298,36 @@ def test_step_records_why_an_entry_was_skipped():
 def test_limits_from_env_override_only_the_given_fields():
     from trader import limits_from_env
 
-    limits = limits_from_env({"MAX_POSITION_FRACTION": "0.45", "MAX_TRADES_PER_DAY": "3"}, DEFAULT_LIMITS)
+    limits = limits_from_env({"MAX_POSITION_FRACTION": "0.45", "MAX_TRADES_PER_DAY": "3", "MAX_QUOTE_AGE_SECONDS": "20"}, DEFAULT_LIMITS)
 
     assert limits.max_position_fraction == 0.45
     assert limits.max_trades_per_day == 3
+    assert limits.max_quote_age_seconds == 20.0
     assert limits.risk_fraction == DEFAULT_LIMITS.risk_fraction
     assert limits.cutoff == DEFAULT_LIMITS.cutoff
+
+
+def test_limits_from_env_refuses_values_outside_their_safe_range_by_name():
+    from trader import limits_from_env
+
+    for variable, value in (
+        ("RISK_FRACTION", "1.5"),
+        ("RISK_FRACTION", "0"),
+        ("MAX_POSITION_FRACTION", "20"),
+        ("MAX_DAILY_LOSS_FRACTION", "-0.02"),
+        ("MAX_TRADES_PER_DAY", "0"),
+        ("ENTRY_TIMEOUT_SECONDS", "-5"),
+        ("FEE_PER_ORDER", "-1"),
+        ("MIN_GAIN_TO_FEE_RATIO", "nan"),
+        ("SIZING_EQUITY_CAP", "0"),
+        ("MAX_QUOTE_AGE_SECONDS", "0"),
+        ("RISK_FRACTION", "one percent"),
+        ("MAX_TRADES_PER_DAY", ""),
+    ):
+        with pytest.raises(ValueError, match=f"{variable}={value!r}"):
+            limits_from_env({variable: value}, DEFAULT_LIMITS)
+
+    assert limits_from_env({"RISK_FRACTION": "1", "FEE_PER_ORDER": "0"}, DEFAULT_LIMITS).risk_fraction == 1.0
 
 
 def test_no_entries_in_the_last_minutes_before_the_cutoff():
@@ -551,6 +575,60 @@ def test_restore_day_seeds_the_daily_limits_from_todays_journal(tmp_path):
     assert state.trades_today == 2
     assert state.daily_pnl == pytest.approx(-10.0 + 5.0)
     assert len(state.fills) == 4 and all(fill.at.date() == today.date() for fill in state.fills)
+
+
+def test_decide_never_enters_or_exits_on_a_stale_quote_but_still_exits_at_the_cutoff():
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    limit = pd.Timedelta(seconds=DEFAULT_LIMITS.max_quote_age_seconds)
+    reads = []
+
+    def counted() -> Account:
+        reads.append(1)
+        return funds()
+
+    stale_stop = quote_at(setup.stop - 0.01, t0)
+    position = held_position(setup, t0)
+    holding = replace(ExecutionState.fresh(), position=position, last_candle=setup.timestamp)
+    assert isinstance(decide(holding, snapshot, stale_stop, t0 + limit, counted, DEFAULT_LIMITS), Exit)
+    assert isinstance(decide(holding, snapshot, stale_stop, t0 + limit + SECONDS, counted, DEFAULT_LIMITS), Nothing)
+    stale_target = quote_at(setup.target + 0.01, t0)
+    assert isinstance(decide(holding, snapshot, stale_target, t0 + limit + SECONDS, counted, DEFAULT_LIMITS), Nothing)
+
+    at_cutoff = pd.Timestamp("2026-09-15 15:50:00", tz=NEW_YORK)
+    decision = decide(holding, snapshot, stale_stop, at_cutoff, counted, DEFAULT_LIMITS)
+    assert isinstance(decision, Exit) and decision.reason == "cutoff"
+
+    flat = ExecutionState.fresh()
+    assert isinstance(decide(flat, snapshot, quote_at(setup.price, t0), t0 + limit + SECONDS, counted, DEFAULT_LIMITS), Nothing)
+    assert reads == []
+    assert isinstance(decide(flat, snapshot, quote_at(setup.price, t0 + limit), t0 + limit + SECONDS, counted, DEFAULT_LIMITS), Enter)
+    assert reads == [1]
+
+
+def test_step_waits_for_a_fresh_quote_before_entering_without_consuming_the_candle():
+    setup = buy_setup()
+    snapshot = snapshot_of(setup)
+    t0 = snapshot.published_at
+    store = SignalStore()
+    store.publish(snapshot)
+    store.publish_quote(quote_at(setup.price, t0 - 5 * pd.Timedelta(minutes=1)))
+    broker = ScriptedBroker({"buy-1": [OrderState("SUBMITTED", 0, 0.0)]})
+
+    waiting = step(ExecutionState.fresh(), store, broker, "SPCX", t0, DEFAULT_LIMITS)
+    assert waiting.pending_order is None and waiting.last_candle is None and broker.buys == []
+    assert waiting.last_skip == f"{setup.timestamp.strftime('%H:%M')} waiting: quote is 300s old, over the 60s limit"
+
+    store.publish_quote(LiveQuote("SPCX", None, None, None, t0, "quote rights taken by the moomoo app"))
+    down = step(waiting, store, broker, "SPCX", t0 + 2 * SECONDS, DEFAULT_LIMITS)
+    assert down.pending_order is None and broker.buys == []
+    assert "waiting: no live quote: quote rights taken by the moomoo app" in down.last_skip
+
+    store.publish_quote(quote_at(setup.price, t0 + 4 * SECONDS))
+    entered = step(down, store, broker, "SPCX", t0 + 4 * SECONDS, DEFAULT_LIMITS)
+    assert entered.pending_order.order_id == "buy-1" and entered.last_candle == setup.timestamp
+    assert len(broker.buys) == 1
 
 
 def test_decide_exits_at_the_cutoff_even_when_the_quote_feed_is_down():
@@ -928,28 +1006,43 @@ def test_kill_switch_stops_re_sending_a_sell_after_three_rejections():
     assert state.halted.startswith("kill switch") and "3 sell attempts" in state.halted and "flatten in moomoo" in state.halted
 
 
-def test_run_executor_forever_retries_a_failed_start_up_query_and_publishes_a_crash(monkeypatch):
+def test_run_executor_forever_retries_start_up_failures_and_outlives_an_unexpected_error(monkeypatch):
     import executor
 
     class BootBroker(ScriptedBroker):
-        def __init__(self, failures):
-            super().__init__({}, held=0)
-            self.failures = list(failures)
+        def __init__(self, boot_failures, account_failures):
+            super().__init__({"buy-1": [OrderState("SUBMITTED", 0, 0.0)]}, held=0)
+            self.boot_failures = list(boot_failures)
+            self.account_failures = list(account_failures)
 
         def holding(self, symbol: str) -> Holding:
-            if self.failures:
-                raise self.failures.pop(0)
+            if self.boot_failures:
+                raise self.boot_failures.pop(0)
             return super().holding(symbol)
 
-    def sleep_twice_then_stop(_seconds: float) -> None:
-        sleep_twice_then_stop.calls += 1
-        if sleep_twice_then_stop.calls >= 2:
+        def account(self) -> Account:
+            if self.account_failures:
+                raise self.account_failures.pop(0)
+            return super().account()
+
+    def sleep_then_stop(_seconds: float) -> None:
+        sleep_then_stop.calls += 1
+        if sleep_then_stop.calls >= 5:
             raise KeyboardInterrupt
 
-    sleep_twice_then_stop.calls = 0
-    monkeypatch.setattr(executor.time, "sleep", sleep_twice_then_stop)
+    sleep_then_stop.calls = 0
+    monkeypatch.setattr(executor.time, "sleep", sleep_then_stop)
+    setup = buy_setup()
     store = SignalStore()
-    broker = BootBroker([ConnectionError("OpenD position_list_query failed for US.SPCX (SIMULATE): disconnected")])
+    store.publish(snapshot_of(setup))
+    store.publish_quote(quote_at(setup.price, pd.Timestamp.now(tz=NEW_YORK)))
+    broker = BootBroker(
+        [
+            ConnectionError("OpenD position_list_query failed for US.SPCX (SIMULATE): disconnected"),
+            TypeError("unsupported operand type(s) for /: 'str' and 'int'"),
+        ],
+        [TypeError("'NoneType' object is not subscriptable")],
+    )
     published = []
     monkeypatch.setattr(store, "publish_execution", published.append)
 
@@ -957,11 +1050,8 @@ def test_run_executor_forever_retries_a_failed_start_up_query_and_publishes_a_cr
         executor.run_executor_forever(store, broker, "SPCX", DEFAULT_LIMITS, 0.0)
 
     assert "starting up" in published[0].halted and "disconnected" in published[0].halted
-    assert published[1].halted is None and is_flat(published[1])
-
-    sleep_twice_then_stop.calls = 0
-    crashing = BootBroker([TypeError("unsupported operand type(s) for /: 'str' and 'int'")])
-    published.clear()
-    with pytest.raises(TypeError):
-        executor.run_executor_forever(store, crashing, "SPCX", DEFAULT_LIMITS, 0.0)
-    assert published[-1].halted.startswith("executor crashed: TypeError")
+    assert "starting up" in published[1].halted and "TypeError" in published[1].halted
+    assert published[2].halted is None and is_flat(published[2])
+    assert is_flat(published[3]) and "TypeError" in published[3].broker_error and "retried" in published[3].broker_error
+    assert published[4].pending_order.order_id == "buy-1" and published[4].broker_error is None
+    assert broker.buys == [("SPCX", published[4].pending_order.quantity, published[4].pending_order.limit_price)]

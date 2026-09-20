@@ -5,11 +5,22 @@
 # Later runs:  ./opend.sh daemon   (reuses the remembered login, no console, backgrounds itself)
 #
 # OpenD listens on MOOMOO_HOST:MOOMOO_PORT from .env (default 127.0.0.1:11111).
+# OPEND_DIR is the only .env setting this script reads.
 set -euo pipefail
 
 cd "$(dirname "$0")"
-set -a; source .env; set +a
 
+opend_dir_from_env_file() {
+  [[ -f .env ]] || return 0
+  local line
+  line="$(grep -E '^OPEND_DIR=' .env | tail -n 1)" || return 0
+  local value="${line#OPEND_DIR=}"
+  value="${value#\"}"; value="${value%\"}"
+  value="${value#\'}"; value="${value%\'}"
+  print -r -- "$value"
+}
+
+OPEND_DIR="$(opend_dir_from_env_file)"
 OPEND_DIR="${OPEND_DIR:-opend}"
 BINARY="$OPEND_DIR/OpenD.app/Contents/MacOS/OpenD"
 

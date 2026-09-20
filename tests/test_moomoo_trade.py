@@ -93,3 +93,37 @@ def test_holding_averages_only_the_lots_with_a_valid_cost_price():
 
     broker._context = StubTradeContext([{"code": "US.QQQ", "qty": 5, "cost_price": 700.0, "cost_price_valid": True}])
     assert broker.holding("SPCX").quantity == 0
+
+
+class MalformedTradeContext:
+    """Answers RET_OK with frames OpenD should never send: empty, missing columns, or NaN quantities."""
+
+    def accinfo_query(self, trd_env: str, currency: str):
+        return RET_OK, pd.DataFrame(columns=["total_assets", "cash"])
+
+    def place_order(self, price, qty, code, trd_side, order_type, trd_env):
+        return RET_OK, pd.DataFrame([{"code": code, "order_status": "SUBMITTED"}])
+
+    def order_list_query(self, trd_env: str, order_id: str = "", code: str = ""):
+        row = {"code": "US.SPCX", "order_id": "77", "trd_side": "BUY", "qty": 10.0, "price": 150.0, "order_status": "SUBMITTED",
+               "dealt_qty": float("nan"), "dealt_avg_price": 0.0, "create_time": "2026-09-15 15:00:01"}
+        return RET_OK, pd.DataFrame([row])
+
+    def position_list_query(self, code: str, trd_env: str):
+        return RET_OK, pd.DataFrame([{"code": code, "qty": 10}])
+
+
+def test_malformed_gateway_frames_raise_connection_errors_that_show_the_frame():
+    broker = MoomooBroker(HOST, PORT, "SIMULATE", "FUTUSG")
+    broker._context = MalformedTradeContext()
+
+    with pytest.raises(ConnectionError, match="accinfo_query.*IndexError"):
+        broker.account()
+    with pytest.raises(ConnectionError, match="place_order.*KeyError.*'order_status': 'SUBMITTED'"):
+        broker.buy_limit("SPCX", 10, 150.0)
+    with pytest.raises(ConnectionError, match="order_list_query.*dealt_qty is nan"):
+        broker.order("77")
+    with pytest.raises(ConnectionError, match="order_list_query.*dealt_qty is nan.*'order_id': '77'"):
+        broker.orders("SPCX")
+    with pytest.raises(ConnectionError, match="position_list_query.*KeyError.*cost_price_valid"):
+        broker.holding("SPCX")

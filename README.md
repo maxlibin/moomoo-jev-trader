@@ -78,7 +78,7 @@ Useful official references:
 - [OpenAPI quick start](https://openapi.moomoo.com/moomoo-api-doc/en/quick/started.html)
 - [Python API documentation](https://openapi.moomoo.com/moomoo-api-doc/en/)
 
-Moomoo rate-limits its trade queries (about ten account or order queries per 30 seconds). The executor asks Jev before it reads the account, reads the account only when a new entry is possible, and re-reads an open order every four seconds. A failed OpenD query is shown on the dashboard as a broker error and retried on the next pass rather than stopping risk management. A failed order *placement* is never simply re-sent: OpenD's client gives up after 12 seconds even when the order was accepted, so the executor notes every order the broker already lists before it sends one, then adopts only an order that appeared afterwards, re-sends a sell only when the broker still shows every tracked share, and skips an entry it cannot find. A start-up query that fails is retried with the error on the dashboard instead of leaving the account unmanaged.
+Moomoo rate-limits its trade queries (about ten account or order queries per 30 seconds). The executor asks Jev before it reads the account, reads the account only when a new entry is possible, and re-reads an open order every four seconds. A failed OpenD query is shown on the dashboard as a broker error and retried on the next pass rather than stopping risk management. A failed order *placement* is never simply re-sent: OpenD's client gives up after 12 seconds even when the order was accepted, so the executor notes every order the broker already lists before it sends one, then adopts only an order that appeared afterwards, re-sends a sell only when the broker still shows every tracked share, and skips an entry it cannot find. A start-up query that fails is retried with the error on the dashboard instead of leaving the account unmanaged, and an answer OpenD gives in a shape the connector cannot read is treated the same way as a failed query. Any other failure inside the executor is logged with its traceback, shown on the dashboard, and retried on the next pass, so the kill switch and the cutoff exit keep working.
 
 ### Optional macOS command-line launcher
 
@@ -219,13 +219,14 @@ The executor is long-only and includes:
 - Limit-entry timeout
 - Fee-aware minimum expected gain
 - Stop, target, and end-of-session exits; the cutoff exit fires even while the quote feed is down
+- No entry, stop, or target acts on a quote whose exchange stamp is older than `MAX_QUOTE_AGE_SECONDS`, so delayed entitlements and an OpenD gateway repeating its last quote during an outage cannot trigger orders; the wait is shown on the execution line
 - Exit orders tracked until the broker confirms the fill; an exit that dies unfilled halts the executor with the shares still shown on the dashboard, and one OpenD reports as `TIMEOUT` is shown as unresolved and re-read until it settles
 - Unconfirmed placements reconciled against the broker's order list instead of being re-sent; a rejected sell is retried after a pause and at most three times before the executor asks for manual reconciliation
 - Daily trade count and realised loss restored from `logs/fills.csv` on restart (sells matched to buys), so restarting cannot reset the limits; a buy with no journaled sell blocks the day until the journal is corrected
 - Shares already in the account at start-up stop the strategy; the kill switch sells exactly what the broker reports
 - Browser kill switch that cancels entries, flattens, and keeps flattening until the broker reports nothing open or the sell has been rejected three times; the endpoint only accepts requests from the dashboard page on localhost
 
-Review `.env.example` for every setting.
+Review `.env.example` for every setting. Each risk and Jev setting is range-checked at start-up; a value outside its range (`RISK_FRACTION=1` would be the whole account per trade) refuses to start with the variable and value named.
 
 ## Development
 

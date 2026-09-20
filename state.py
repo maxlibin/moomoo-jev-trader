@@ -56,6 +56,13 @@ class LiveQuote:
     error: Optional[str]
 
 
+def quote_age_seconds(quote: LiveQuote, now: pd.Timestamp) -> Optional[float]:
+    """Seconds from the exchange stamp to ``now``, or None when the feed gave no stamp."""
+    if quote.quoted_at is None:
+        return None
+    return (now - quote.quoted_at).total_seconds()
+
+
 class SignalStore:
     """Holds the most recent snapshot, live quote, and execution state behind a lock."""
 

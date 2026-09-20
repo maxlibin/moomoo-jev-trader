@@ -3,11 +3,15 @@
 Defaults to the simulated account. Real-money trading needs ``environment="REAL"``
 and a trading unlock done in the OpenD window; this module never handles the
 trade password. Every call raises ``ConnectionError`` with the gateway's own
-message on failure.
+message on failure, and with the frame itself when the gateway answers with one
+this connector cannot read, so a malformed answer is retried or reconciled by
+the executor like any other gateway failure.
 """
 
-from typing import Optional
+import math
+from typing import Callable, Optional, TypeVar
 
+import pandas as pd
 from moomoo import (
     RET_OK,
     Currency,
@@ -25,6 +29,62 @@ from moomoo_feed import moomoo_code
 
 
 ENVIRONMENTS = {"SIMULATE": TrdEnv.SIMULATE, "REAL": TrdEnv.REAL}
+Parsed = TypeVar("Parsed")
+
+
+def _read(call: str, data: pd.DataFrame, parse: Callable[[pd.DataFrame], Parsed]) -> Parsed:
+    """``parse(data)``, with a frame the parser rejects reported as the gateway failure it is."""
+    try:
+        return parse(data)
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise ConnectionError(
+            f"OpenD {call} answered with a frame this connector cannot read ({exc!r}); rows: {data.head(5).to_dict('records')}"
+        ) from exc
+
+
+def _number(row: pd.Series, column: str) -> float:
+    value = float(row[column])
+    if not math.isfinite(value):
+        raise ValueError(f"{column} is {value}")
+    return value
+
+
+def _account(data: pd.DataFrame) -> Account:
+    row = data.iloc[0]
+    return Account(equity=_number(row, "total_assets"), cash=_number(row, "cash"))
+
+
+def _holding(data: pd.DataFrame, code: str) -> Holding:
+    rows = data.loc[data["code"] == code]
+    quantity = int(rows["qty"].sum()) if not rows.empty else 0
+    if quantity <= 0:
+        return Holding(0, 0.0)
+    priced = rows.loc[rows["cost_price_valid"].astype(bool)]
+    priced_quantity = int(priced["qty"].sum()) if not priced.empty else 0
+    if priced_quantity <= 0:
+        return Holding(quantity, 0.0)
+    return Holding(quantity, float((priced["cost_price"].astype(float) * priced["qty"]).sum() / priced_quantity))
+
+
+def _broker_order(row: pd.Series) -> BrokerOrder:
+    return BrokerOrder(
+        order_id=str(row["order_id"]), side=str(row["trd_side"]), quantity=int(_number(row, "qty")), price=_number(row, "price"),
+        status=str(row["order_status"]), filled_quantity=int(_number(row, "dealt_qty")), average_price=_number(row, "dealt_avg_price"),
+    )
+
+
+def _orders(data: pd.DataFrame, code: str) -> list[BrokerOrder]:
+    rows = data.loc[data["code"] == code].sort_values("create_time", ascending=False)
+    return [_broker_order(row) for _, row in rows.iterrows()]
+
+
+def _order_id(data: pd.DataFrame) -> str:
+    return str(data.iloc[0]["order_id"])
+
+
+def _order_state(data: pd.DataFrame) -> OrderState:
+    row = data.iloc[0]
+    return OrderState(status=str(row["order_status"]), filled_quantity=int(_number(row, "dealt_qty")), average_price=_number(row, "dealt_avg_price"))
 
 
 class MoomooBroker:
@@ -64,8 +124,7 @@ class MoomooBroker:
         ret, data = self._require_context().accinfo_query(trd_env=self._environment, currency=Currency.USD)
         if ret != RET_OK:
             raise ConnectionError(f"OpenD accinfo_query failed ({self._environment}): {data}")
-        row = data.iloc[0]
-        return Account(equity=float(row["total_assets"]), cash=float(row["cash"]))
+        return _read("accinfo_query", data, _account)
 
     def holding(self, symbol: str) -> Holding:
         """Shares held and their average cost; the cost is 0.0 when OpenD reports no valid cost for them."""
@@ -73,15 +132,7 @@ class MoomooBroker:
         ret, data = self._require_context().position_list_query(code=code, trd_env=self._environment)
         if ret != RET_OK:
             raise ConnectionError(f"OpenD position_list_query failed for {code} ({self._environment}): {data}")
-        rows = data.loc[data["code"] == code]
-        quantity = int(rows["qty"].sum()) if not rows.empty else 0
-        if quantity <= 0:
-            return Holding(0, 0.0)
-        priced = rows.loc[rows["cost_price_valid"].astype(bool)]
-        priced_quantity = int(priced["qty"].sum()) if not priced.empty else 0
-        if priced_quantity <= 0:
-            return Holding(quantity, 0.0)
-        return Holding(quantity, float((priced["cost_price"].astype(float) * priced["qty"]).sum() / priced_quantity))
+        return _read("position_list_query", data, lambda frame: _holding(frame, code))
 
     def orders(self, symbol: str) -> list[BrokerOrder]:
         """Today's orders for ``symbol`` as OpenD reports them, newest first."""
@@ -89,14 +140,7 @@ class MoomooBroker:
         ret, data = self._require_context().order_list_query(code=code, trd_env=self._environment)
         if ret != RET_OK:
             raise ConnectionError(f"OpenD order_list_query failed for {code} ({self._environment}): {data}")
-        rows = data.loc[data["code"] == code].sort_values("create_time", ascending=False)
-        return [
-            BrokerOrder(
-                order_id=str(row["order_id"]), side=str(row["trd_side"]), quantity=int(row["qty"]), price=float(row["price"]),
-                status=str(row["order_status"]), filled_quantity=int(row["dealt_qty"]), average_price=float(row["dealt_avg_price"]),
-            )
-            for _, row in rows.iterrows()
-        ]
+        return _read("order_list_query", data, lambda frame: _orders(frame, code))
 
     def _place(self, symbol: str, quantity: int, side: TrdSide, order_type: OrderType, price: float) -> str:
         code = moomoo_code(symbol)
@@ -105,7 +149,7 @@ class MoomooBroker:
         )
         if ret != RET_OK:
             raise ConnectionError(f"OpenD place_order failed: {side} {quantity} {code} @ {price} ({self._environment}): {data}")
-        return str(data.iloc[0]["order_id"])
+        return _read("place_order", data, _order_id)
 
     def buy_limit(self, symbol: str, quantity: int, price: float) -> str:
         return self._place(symbol, quantity, TrdSide.BUY, OrderType.NORMAL, price)
@@ -119,8 +163,7 @@ class MoomooBroker:
             raise ConnectionError(f"OpenD order_list_query failed for order {order_id} ({self._environment}): {data}")
         if data.empty:
             raise ConnectionError(f"OpenD returned no order with id {order_id} ({self._environment})")
-        row = data.iloc[0]
-        return OrderState(status=str(row["order_status"]), filled_quantity=int(row["dealt_qty"]), average_price=float(row["dealt_avg_price"]))
+        return _read("order_list_query", data, _order_state)
 
     def cancel(self, order_id: str) -> None:
         ret, data = self._require_context().modify_order(ModifyOrderOp.CANCEL, order_id, 0, 0, trd_env=self._environment)
