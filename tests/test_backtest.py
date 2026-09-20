@@ -1,6 +1,5 @@
 """Fee-aware event backtester on the synthetic one-minute fixture bars."""
 
-from dataclasses import replace
 from pathlib import Path
 
 import pandas as pd
